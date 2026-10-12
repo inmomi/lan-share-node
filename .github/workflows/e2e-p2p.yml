@@ -1,0 +1,127 @@
+name: P2P 真实浏览器端到端
+
+# test.js 里的 P2P 部分是拿假 DataChannel 在 Node 里跑 pacing 逻辑，验证得了
+# 边界，但验证不了"真实 Chrome 的 SCTP 到底能跑多快"——而这正是用户遇到的
+# 问题：同一对设备 SMB 30MB/s，点对点只有 5.8MB/s。
+# 这个工作流在 Runner 上拉起两个真实 Chrome（各自独立进程、独立 profile），
+# 让它们互相发现，然后：
+#   1. TCP 基线：同机服务端上传/下载，作为对照；
+#   2. 内置 speedP2p：冷/热各跑一次，报链路诊断（候选对类型、RTT）；
+#   3. 真实文件传输（默认 64MB）：自动点确认框、等下载落盘、逐字节 SHA-256
+#      校验——并行分段拼回去只要错一段，这里就会现形。
+#
+# Runner 上的 Chrome 走的是真实内核 loopback（候选对 127.0.0.1 或本机网卡
+# host↔host），没有开发机沙箱那套虚拟网络的干扰，数字才是可用的。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  p2p-e2e:
+    name: 双 Chrome 真实传输 (${{ matrix.file-mb }}MB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # 64MB 看稳态吞吐；16MB 看冷启动（连接刚建好时的爬坡）。
+        file-mb: [64, 16]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # ubuntu-24.04 镜像不再预装 Chrome，直接下官方 .deb 用 apt 装
+      # （apt 会自动补依赖）。已有 Chrome 的镜像跳过这步。
+      # 注意：$GITHUB_ENV 要等本步骤结束才被 runner 读取，当前 shell 里
+      # 读不到它，所以先落到局部变量再写进去。
+      - name: 安装 / 定位 Chrome
+        run: |
+          set -e
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
+            curl -fsSL --max-time 300 -o chrome.deb \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+            sudo apt-get install -y -qq ./chrome.deb
+          fi
+          FOUND=""
+          for c in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then
+              FOUND=$(command -v "$c")
+              break
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::Chrome 装上了但不在 PATH 里"
+            exit 1
+          fi
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
+
+      # 服务端由脚本自己拉（node server.js + 临时上传目录），无需编译
+      - name: P2P 端到端（TCP 基线 + 冷/热测速 + 真实文件 + 逐字节校验 + lane 扫描）
+        run: node tools/p2p-e2e.js --file-mb ${{ matrix.file-mb }} --timeout 240 --label ci-${{ matrix.file-mb }}mb --sweep 1,2,4,8,16,32 --sweep-mb 16
+
+  # 无损 loopback 上 4 条 lane 就见到共享瓶颈（包速率/CPU），加 lane 反而略降。
+  # 但用户的真实链路是 Wi-Fi：有丢包时每关联的拥塞窗口会坍缩，多关联是对抗
+  # 丢包的手段——无损环境模拟不出这个。这里用 tc netem 给 loopback 加损伤，
+  # 让 TCP 基线和各 lane 数在同等损伤下正面对比。
+  # 实测（20ms + 2%）：TCP 4.5~7.2 MB/s，P2P 1 条≈0、4 条 0.9、8 条 1.6、
+  # 16 条 2.8 MB/s——聚合随 lane 数线性增长，丢包下多关联就是硬道理。
+  sweep-lossy:
+    name: lane 扫描（${{ matrix.delay }}ms + ${{ matrix.loss }}% 丢包）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 两档损伤：2% 是偏差的 Wi-Fi，0.5% 是普通 Wi-Fi，把用户的可能区间夹住
+        include:
+          - { delay: 20, loss: 2 }
+          - { delay: 5, loss: 0.5 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 两个浏览器在同主机，host candidate 走本机 IP，Linux 本地交付经过 lo，
+      # 所以 netem 挂在 lo 上即可。信令（127.0.0.1 TCP）同样受影响——但这正是
+      # 想要的：TCP 基线也在同等损伤下测，对比才公平。
+      - name: 给 loopback 加损伤（${{ matrix.delay }}ms + ${{ matrix.loss }}%）
+        run: |
+          set -e
+          sudo tc qdisc add dev lo root netem delay ${{ matrix.delay }}ms loss ${{ matrix.loss }}%
+          tc qdisc show dev lo
+
+      - name: 安装 / 定位 Chrome
+        run: |
+          set -e
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
+            curl -fsSL --max-time 300 -o chrome.deb \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+            sudo apt-get install -y -qq ./chrome.deb
+          fi
+          FOUND=""
+          for c in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then
+              FOUND=$(command -v "$c")
+              break
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::Chrome 装上了但不在 PATH 里"
+            exit 1
+          fi
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
+
+      - name: P2P 扫描（同等丢包下：TCP 基线 vs 1/2/4/8/16/32 条 lane）
+        run: node tools/p2p-e2e.js --file-mb 16 --timeout 300 --label lossy${{ matrix.loss }} --sweep 1,2,4,8,16,32 --sweep-mb 16

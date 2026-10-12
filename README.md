@@ -16,6 +16,18 @@
 
 **关于速度**：P2P 直传走 WebRTC DataChannel，有两条浏览器硬限制——单条消息不能超过 `sctp.maxMessageSize`（Chrome 默认 256KB），发送队列总共只有约 16MB，`bufferedAmount` 一超过 `send()` 就直接抛 `RTCDataChannel send queue is full`（不是排队，是抛异常）。 pacing 逻辑集中在 `public/p2p-pump.js`，高水位取 4MB、离上限留足余量，并且一次读 8MB 再切块发送，避免每 256KB 就走一次 Blob IPC 把带宽卡在读速上。
 
+**点对点默认开 32 条并行通道**。一个 `RTCPeerConnection` 只有一个 SCTP 关联，拥塞窗口、接收窗口、消息粒度全是按关联算的——实测同一对设备 TCP（SMB）能跑 30MB/s，而单条 DataChannel 只有 3.2MB/s，瓶颈在每关联的机制里，不在链路上，所以加带宽没用，只能加关联。文件按字节范围切段，每条通道独立推一段（各自的 ICE / DTLS / SCTP / 拥塞窗口），接收端按通道顺序拼回原文件。注意同一条关联上开多个 DataChannel 是没用的，它们共享同一个拥塞窗口。
+
+32 这个值是 CI 双 Chrome + `tc netem` 扫出来的（`tools/p2p-e2e.js --sweep`，速率由对端计时）：
+
+| 链路 | 4 条 | 8 条 | 16 条 | 32 条 |
+|---|---|---|---|---|
+| 无损 loopback（TCP 300+ MB/s） | 39 MB/s | 37 | 32 | 32 |
+| 5ms + 0.5% 丢包（TCP 26~38） | 6.4 | 11.7 | 11.0 | **13.5** |
+| 20ms + 2% 丢包（TCP 3.6~6.7） | 0.9 | 1.6 | 3.1 | **5.1** |
+
+好链路上 4 条和 32 条只差 ~20%，但**丢包链路（Wi-Fi 常态）上 32 条是 4 条的 2~5.7 倍**——每关联的拥塞窗口一丢包就坍缩，只有并联能补，且到 32 条仍未饱和。任何一条 lane 没打开（20 秒超时）会自动退役，本次传输只用双方都活着的那批：file-offer / file-accept 互换活 lane 集合，按交集切段，段数永远对齐。测速页会同时显示链路诊断（候选对类型 host↔host / RTT）和单条通道的速率。
+
 ## 运行
 
 ```bash
@@ -47,7 +59,7 @@ Windows 双击 `start.bat` 即可。
 - **零第三方依赖**。WebSocket 服务端是按 RFC 6455 自己实现的握手与帧编解码，不装 `ws`；上传用裸请求体流式落盘，不装 `multer`/`busboy`。`npm install` 什么都不用装。
 - **不配 STUN/TURN**。纯内网场景下 WebRTC 用本机内网 IP 的 host candidate 就能直连，因此完全离线可用。
 - **分块 + 背压 + 预读**。切片取 `RTCSctpTransport.maxMessageSize` 与 1 MB 的较小值（Chrome 默认 256 KB，比旧的 64 KB 快一个量级）；背压高水位 4 MB、低水位 1 MB，**窗口没打满就连续发、打满了才等一次低水位**。两个坑都踩过：高水位不要往 16 MB 调——Chrome 的 DataChannel 发送队列总共只有约 16 MB，`bufferedAmount` 一超过，`send()` 不是排队而是直接抛 `RTCDataChannel send queue is full`，整次传输当场判死（本机实测 16.3 MB 处必现）；也不要每发一块都等一次——`bufferedamountlow` 的阈值默认是 0、要等整队泄空才触发，实际放行全靠 50 ms 轮询，每块赔一个轮询周期，吞吐被钉在 5 MB/s 左右（实测两个版本都卡在 5M/b）。发送前一次读 8 MB 再切块，避免每块都串行等一次磁盘读取。
-- **点对点 4 条并行通道**。一个 `RTCPeerConnection` 只有一个 SCTP 关联，拥塞窗口、接收窗口、消息粒度全是按关联算的——实测同一对设备 TCP（SMB）能跑 30MB/s，单条 DataChannel 只有 3.2MB/s，瓶颈在每关联的机制里，不在链路上。文件按 `splitRange` 切成 4 段，每条通道（独立 pc / ICE / DTLS / SCTP / 拥塞窗口）推一段，接收端按通道顺序拼回。同一条关联上开多个 DataChannel 没用，共享拥塞窗口。测速页显示链路诊断（host↔host / RTT）和单通道速率，用来判断并行到底有没有赚到。
+- **点对点 32 条并行通道**。一个 `RTCPeerConnection` 只有一个 SCTP 关联，拥塞窗口、接收窗口、消息粒度全是按关联算的——实测同一对设备 TCP（SMB）能跑 30MB/s，单条 DataChannel 只有 3.2MB/s，瓶颈在每关联的机制里，不在链路上。文件按 `splitRange` 切成若干段，每条通道（独立 pc / ICE / DTLS / SCTP / 拥塞窗口）推一段，接收端按通道顺序拼回。同一条关联上开多个 DataChannel 没用，共享拥塞窗口。lane 数定 32 是 CI 在 `tc netem` 损伤下扫出来的（见上文速度一节）：丢包链路上聚合吞吐随 lane 数单调增长，4 条的 2~5.7 倍。任何一条 lane 打不开（20 秒超时）就退役，双方交换活 lane 集合、按交集切段——一边少一条 lane 也不会让段数错位、永远等不到收尾。测速页显示链路诊断（host↔host / RTT）和单通道速率，用来判断并行到底有没有赚到。
 - **断点续传**。直传按 `name|size|lastModified` 生成 `fileId`，中断时记下已收偏移，重发时接收端回 `offset` 从断点继续；文件库上传按 4 MB 分块带 `offset` 续写 `.part`，先查 `/api/upload-status` 定位起点；下载由 HTTP Range 提供。
 - **设备名持久化**。浏览器端存 `localStorage`，服务端按 IP 记住上次的名字，刷新和重连都保持。
 - **pacing 单独一个文件**。`public/p2p-pump.js` 用 UMD 包了一层，Node 里可以直接 `require`；测试用假 DataChannel 复现 Chrome 的 16 MB 队列上限来跑真代码——背压阈值这类边界靠真机点文件是点不出来的。
@@ -62,7 +74,7 @@ Windows 双击 `start.bat` 即可。
 npm test
 ```
 
-`test.js` 会自己拉起服务、跑完 85 项断言再关闭它，覆盖：
+`test.js` 会自己拉起服务、跑完 114 项断言再关闭它，覆盖：
 
 - 静态托管、目录穿越防护（明文与编码两种）
 - 上传 / 下载 / 删除、中文与特殊文件名往返、同名自动重命名
@@ -75,6 +87,31 @@ npm test
   复现 Chrome 那 16MB 发送队列上限，验证 64MB 文件一次发完、不抛"队列满"、
   缓冲从不越界、慢通道与续传起点都正确
 - **测速接口**：整块 POST / 下载 / 删除
+
+### 真实浏览器点对点测试
+
+假 DataChannel 验证不了"真实 Chrome 的 SCTP 到底能跑多快"——而这正是排查
+点对点慢的关键。`tools/p2p-e2e.js` 拉起两个独立 Chrome 进程（零依赖，直接用
+Node 内置 WebSocket 走 CDP，不装 puppeteer），让它们互相发现，然后：
+
+1. **TCP 基线**：同机服务端上传/下载——点对点数字只有和它比才有意义；
+2. **内置测速**：冷连接、热连接各跑一次 `speedP2p`，报候选对类型与 RTT；
+3. **真实文件传输**（默认 64MB）：自动点接收确认框、等下载落盘、逐字节 SHA-256
+   校验——并行 lane 分段拼回去只要错一段就会现形。
+
+```bash
+node tools/p2p-e2e.js --file-mb 64 --timeout 240
+```
+
+加 `--sweep 1,2,4,8,16,32` 还会逐档扫描并行 lane 数（速率由对端计时，不受发送
+队列吸收影响），回答"并行到底能不能线性扩展"。
+
+注意区分两个速率：**交付速率**只算到发送端字节入队（DataChannel 队列上限
+16MB，能吸收好几秒数据，会虚高），**端到端速率**算到对端文件落盘，才是真实值。
+
+CI 每次 push 都跑（[e2e-p2p.yml](.github/workflows/e2e-p2p.yml)，64MB 与 16MB
+两档，外加两档 `tc netem` 丢包下的 lane 扫描）：Runner 上的 Chrome 走真实内核
+loopback，没有开发机沙箱虚拟网络的干扰。
 
 页面里有「网速测试」标签，分**服务端下载、服务端上传、点对点**三段测。用法是拿它定位瓶颈：
 

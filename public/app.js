@@ -324,14 +324,28 @@ async function handleSignal(from, data) {
   }
 }
 
+/* 单条 lane 等待打开的上限。32 条 lane 里坏一条不该让整个连接永远等下去
+ * （丢包链路上 ICE/DTLS 握手失败的概率随 lane 数线性增长）。超时的 lane
+ * 会被退役，下次 ensureChannel 时重建，本次传输只用活着的 lane。 */
+const LANE_OPEN_TIMEOUT = 20000;
+
 async function ensureChannel(peerId) {
   let conn = state.conns.get(peerId);
   if (!conn || conn.lanes.some((l) => !l.dc)) conn = await initiate(peerId);
-  await Promise.all(conn.lanes.map((l) => l.ready));
-  if (conn.lanes.some((l) => !l.dc || l.dc.readyState !== 'open')) {
-    throw new Error('点对点通道未就绪');
+  await Promise.all(conn.lanes.map((l) => (l.ready
+    ? Promise.race([
+      l.ready,
+      new Promise((r) => setTimeout(r, LANE_OPEN_TIMEOUT)),
+    ])
+    : Promise.resolve())));
+  const live = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open');
+  /* 没打开的 lane 退役掉：半开的 pc 留着只会漏资源，且下一次会在这里重建。
+   * 先拷贝再遍历——retireLane 会往 conn.lanes 里写新对象。 */
+  for (const l of conn.lanes.slice()) {
+    if (!live.includes(l) && l.dc) retireLane(l);
   }
-  return conn;
+  if (!live.length) throw new Error('点对点通道未就绪');
+  return { conn, live };
 }
 
 /* ------------------------------------------------------------ data channel */
@@ -352,7 +366,7 @@ function waitAccept(tid) {
 /** 单块大小。Chrome 的 sctp.maxMessageSize 默认 262144，超过 send() 会直接抛错。 */
 
 async function sendOne(peerId, file) {
-  const conn = await ensureChannel(peerId);
+  const { live } = await ensureChannel(peerId);
   const tid = makeId();
   const fileId = fileIdOf(file.name, file.size, file.lastModified);
 
@@ -368,9 +382,12 @@ async function sendOne(peerId, file) {
   });
   rec.fileId = fileId;
 
-  /* 控制消息固定走 lane 0，数据按范围铺到所有 lane 上 */
-  conn.lanes[0].dc.send(JSON.stringify({
+  /* 控制消息走第一条活 lane，数据随后按范围铺到所有活 lane 上。
+   * lanes 带上本端活着的 lane 编号：对端用自己的活lane 集合取交集，
+   * 两边段数才能对齐（任何一边少一条 lane，写死 LANES 就会永远等不到收尾）。 */
+  live[0].dc.send(JSON.stringify({
     t: 'file-offer', tid, fileId, name: file.name, size: file.size,
+    lanes: live.map((l) => l.index),
   }));
 
   const accept = await waitAccept(tid);
@@ -380,12 +397,19 @@ async function sendOne(peerId, file) {
   }
 
   const start = accept.offset || 0;
-  /* 把 [start, size) 均分给几条 lane。段与段首尾相接，接收端按 lane 顺序
+  /* 双方活 lane 的交集才是真能用的：发送端活着但接收端已死的 lane，
+   * 字节发过去直接进黑洞，接收端永远等不到那条 lane-end。 */
+  const use = accept.lanes
+    ? live.filter((l) => accept.lanes.includes(l.index))
+    : live;
+  if (!use.length) throw new Error('对端没有可用的传输通道');
+  /* 把 [start, size) 均分给活 lane。段与段首尾相接，接收端按 lane 顺序
    * 拼回去就是原文件——所以这里切的顺序不能乱，也不能漏段。
-   * 每条 lane 是独立的 SCTP 关联，拥塞窗口互不影响：单关联跑 3.2MB/s 时，
-   * 四条并联能接近链路本身的上限（同一对设备 TCP 实测 30MB/s）。 */
-  const ranges = splitRange(start, file.size, LANES);
-  const laneSent = conn.lanes.map(() => 0);
+   * 每条 lane 是独立的 SCTP 关联，拥塞窗口互不影响：丢包链路上单关联
+   * 的窗口会坍缩，多关联并联是对抗手段（CI 实测 2% 丢包下 4 条 0.9MB/s、
+   * 32 条 5.1MB/s）。 */
+  const ranges = splitRange(start, file.size, use.length);
+  const laneSent = use.map(() => 0);
   const report = () => {
     const total = start + laneSent.reduce((a, b) => a + b, 0);
     updateTransfer(tid, { sent: total, status: '传输中' });
@@ -393,7 +417,7 @@ async function sendOne(peerId, file) {
 
   await Promise.all(ranges.map((range, i) => {
     if (range.to <= range.from) return Promise.resolve();
-    const lane = conn.lanes[i];
+    const lane = use[i];
     /* 字节搬运在 p2p-pump.js 的 pumpFile 里：分块读 + 预读 + 背压 + 队列满重试。
      * 那边可以用假 DataChannel 在 Node 里跑回归测试。end 让每条 lane 只发自己那段。 */
     return pumpFile(lane.dc, file, range.from, {
@@ -518,10 +542,21 @@ async function askReceive(lane, msg) {
     return;
   }
 
-  /* 期望的段数必须和发送端一致：双方都用 splitRange(already, size, LANES)，
-   * 所以收到多少条 lane-end 就是真发完。写死一个数会在文件很小、
-   * 段数不足 LANES 时永远等不到收尾。 */
-  const ranges = splitRange(already, msg.size, LANES);
+  /* 期望的段数 = 双方活 lane 的交集大小（和发送端算的是同一个交集：
+   * 它拿本端活集合和回传的集合取交集后切段）。写死 LANES 会在 lane 死亡
+   * 或文件很小、段数不足时永远等不到收尾。
+   * 老版本对端不发 lanes 字段时退回本端数量（双方都全活时相等）。 */
+  const myLive = lane.session.lanes
+    .filter((l) => l.dc && l.dc.readyState === 'open')
+    .map((l) => l.index);
+  const myLiveSet = new Set(myLive);
+  const useCount = Array.isArray(msg.lanes) && msg.lanes.length
+    ? msg.lanes.filter((i) => myLiveSet.has(i)).length
+    : LANES;
+  if (useCount <= 0) {
+    lane.dc.send(JSON.stringify({ t: 'file-reject', tid: msg.tid }));
+    return;
+  }
   const inc = {
     tid: msg.tid,
     fileId: msg.fileId,
@@ -533,7 +568,7 @@ async function askReceive(lane, msg) {
     priorChunks: (prior && already < msg.size) ? prior.laneBufs.flat() : [],
     laneBufs: lane.session.lanes.map(() => []),
     lanesDone: 0,
-    expectedLanes: ranges.length,
+    expectedLanes: splitRange(already, msg.size, useCount).length,
     received: already,
   };
   state.incoming = inc;
@@ -543,8 +578,10 @@ async function askReceive(lane, msg) {
     tid: msg.tid, name: msg.name, size: msg.size, dir: 'down', peerId: lane.peerId, peerLabel: from,
   });
   updateTransfer(msg.tid, { status: '接收中', sent: inc.received });
+  /* 回传本端活着的 lane：发送端取交集后切段，段数和这边才对得上 */
   lane.dc.send(JSON.stringify({
     t: 'file-accept', tid: msg.tid, fileId: msg.fileId, offset: inc.received,
+    lanes: myLive,
   }));
 }
 
@@ -1012,34 +1049,51 @@ async function linkDiag(pc) {
  * 30MB/s——瓶颈在单个 SCTP 关联里（拥塞窗口/接收窗口/消息粒度），不在链路上。
  * 只测一条的话，测出来的只是关联的上限，会误判成"网络不行"。 */
 async function speedP2p(peerId) {
-  const conn = await ensureChannel(peerId);
+  const { live } = await ensureChannel(peerId);
   const t0 = performance.now();
 
-  const diag = await linkDiag(conn.lanes[0].pc);
+  const diag = await linkDiag(live[0].pc);
   speedLog(`链路：${diag.text}`);
 
   const blob = new Blob([new Uint8Array(SPEED_BYTES)]);
   /* 和真实传输用同一个切分函数，段数、边界完全一致 */
-  const ranges = splitRange(0, SPEED_BYTES, LANES);
-  const lanes = conn.lanes.slice(0, ranges.length);
+  const ranges = splitRange(0, SPEED_BYTES, live.length);
+  const lanes = live.slice(0, ranges.length);
 
-  /* 每条 lane 独立打招呼：发 speedtest、等对端 ready */
+  /* 每条 lane 独立打招呼：发 speedtest、等对端 ready。
+   * 丢包链路上这条控制消息自己就可能丢（用户 Wi-Fi 实测 2% 丢包时必中），
+   * 所以每 2 秒重发一次、最多等 30 秒——不能一丢就判整个测速失败。 */
   await Promise.all(lanes.map((lane, i) => new Promise((resolve, reject) => {
-    const to = setTimeout(() => reject(new Error(`lane ${i} 对端没有回应测速请求`)), 10000);
+    let tries = 0;
+    const send = () => {
+      tries++;
+      try {
+        lane.dc.send(JSON.stringify({
+          t: 'speedtest', bytes: ranges[i].to - ranges[i].from, ch: lane.index,
+        }));
+      } catch (err) {
+        clearInterval(rep); clearTimeout(to);
+        reject(err); return;
+      }
+    };
+    const rep = setInterval(send, 2000);
+    const to = setTimeout(() => {
+      clearInterval(rep);
+      lane.dc.removeEventListener('message', onMsg);
+      reject(new Error(`lane ${i} 对端没有回应测速请求（重发 ${tries} 次）`));
+    }, 30000);
     const onMsg = (e) => {
       if (typeof e.data !== 'string') return;
       let m;
       try { m = JSON.parse(e.data); } catch (_) { return; }
       if (m.t === 'speedtest-ready' && Number(m.ch) === lane.index) {
-        clearTimeout(to);
+        clearInterval(rep); clearTimeout(to);
         lane.dc.removeEventListener('message', onMsg);
         resolve();
       }
     };
     lane.dc.addEventListener('message', onMsg);
-    lane.dc.send(JSON.stringify({
-      t: 'speedtest', bytes: ranges[i].to - ranges[i].from, ch: lane.index,
-    }));
+    send();
   })));
 
   /* 等每条 lane 的回执。超时给 null，不影响其他 lane 出数 */
