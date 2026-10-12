@@ -4,20 +4,14 @@
  * - Signalling over WebSocket (server only relays offers/answers/ICE).
  * - File bytes travel over a WebRTC DataChannel straight between browsers.
  * - The vault tab uploads to / downloads from the server disk.
+ * - DataChannel 的发送 pacing 在 p2p-pump.js（LSPump），浏览器里以全局变量暴露。
  */
 
-/* 传输参数。
- * 单块取 256KB：Chrome 的 RTCSctpTransport.maxMessageSize 默认 262144，
- * 超过它 send() 会直接抛错，所以这是硬上限，不能靠调大来提速。
- *
- * 真正的提速来自背压阈值。原来 DRAIN_LIMIT=1MB / LOW_WATER=256KB，
- * 缓冲一过 1MB 就停发、要等降到 256KB 才继续，SCTP 发送窗口常年空着，
- * 千兆网下实测只有 1MB/s。拉到 16MB / 4MB 后缓冲常驻高位，窗口才填得满。
- *
- * 另外每块之间不要串行 await 磁盘读——改成发当前块时预读下一块。 */
-const MAX_CHUNK = 256 * 1024;
-const DRAIN_LIMIT = 16 * 1024 * 1024;
-const LOW_WATER = 4 * 1024 * 1024;
+/* 背压与分块策略在 p2p-pump.js（LSPump），单独一个文件是为了能在 Node 里
+ * 直接 require 做单测。注意那里的 DRAIN_LIMIT 必须远小于 Chrome DataChannel
+ * 发送队列约 16MB 的硬上限，超了 send() 会直接抛
+ * "RTCDataChannel send queue is full"，把整次传输判死。 */
+const { LOW_WATER, chunkSizeFor, pumpFile } = LSPump;
 
 /* 文件库上传的分块大小。走 HTTP，没有 256KB 的限制，取大一点减少往返。 */
 const UP_CHUNK = 4 * 1024 * 1024;
@@ -293,18 +287,6 @@ async function ensureChannel(peerId) {
 
 /* ------------------------------------------------------------ data channel */
 
-function waitDrain(dc) {
-  if (dc.bufferedAmount <= DRAIN_LIMIT) return Promise.resolve();
-  return new Promise((resolve) => {
-    const done = () => {
-      dc.removeEventListener('bufferedamountlow', done);
-      resolve();
-    };
-    dc.addEventListener('bufferedamountlow', done);
-    setTimeout(done, 5000);
-  });
-}
-
 /** 对端回应接收请求。resolve 出 { ok, offset }，offset 是对方已收到的字节数。 */
 function waitAccept(tid) {
   return new Promise((resolve) => {
@@ -319,17 +301,11 @@ function waitAccept(tid) {
 }
 
 /** 单块大小。Chrome 的 sctp.maxMessageSize 默认 262144，超过 send() 会直接抛错。 */
-function chunkSizeFor(conn) {
-  const cap = conn.pc && conn.pc.sctp ? conn.pc.sctp.maxMessageSize : 0;
-  if (!cap || !Number.isFinite(cap)) return MAX_CHUNK;
-  return Math.max(16 * 1024, Math.min(MAX_CHUNK, cap));
-}
 
 async function sendOne(peerId, file) {
   const conn = await ensureChannel(peerId);
   const tid = makeId();
   const fileId = fileIdOf(file.name, file.size, file.lastModified);
-  const chunk = chunkSizeFor(conn);
 
   const rec = addTransfer({
     tid,
@@ -353,28 +329,12 @@ async function sendOne(peerId, file) {
     return;
   }
 
-  let offset = accept.offset || 0;
-  if (offset > file.size) offset = 0;
-  updateTransfer(tid, {
-    sent: offset,
-    status: offset > 0 ? `续传中（已收 ${humanSize(offset)}）` : '传输中',
+  /* 字节搬运在 p2p-pump.js 的 pumpFile 里：分块读 + 预读 + 背压 + 队列满重试。
+   * 那边可以用假 DataChannel 在 Node 里跑回归测试。 */
+  await pumpFile(conn.dc, file, accept.offset || 0, {
+    chunk: chunkSizeFor(conn),
+    onProgress: (sent) => updateTransfer(tid, { sent, status: '传输中' }),
   });
-
-  /* 预读流水线：发当前块的同时把下一块从磁盘读出来。
-   * 原来每块都是 `读 -> 等缓冲 -> 发` 三步串行，磁盘 I/O 和发送互相干等，
-   * 千兆网下光等就吃掉大半时间。 */
-  let pending = file.slice(offset, offset + chunk).arrayBuffer();
-  while (offset < file.size) {
-    const buf = await pending;
-    const next = offset + buf.byteLength;
-    if (next < file.size) pending = file.slice(next, next + chunk).arrayBuffer();
-
-    await waitDrain(conn.dc);
-    if (conn.dc.readyState !== 'open') throw new Error('连接中断');
-    conn.dc.send(buf);
-    offset = next;
-    updateTransfer(tid, { sent: offset, status: '传输中' });
-  }
 
   conn.dc.send(JSON.stringify({ t: 'file-end', tid, fileId }));
   updateTransfer(tid, { status: '已送达', sent: file.size, done: true });

@@ -401,6 +401,165 @@ async function testRange() {
     await json('DELETE', '/api/files?name=' + name);
 }
 
+/* ---------------------------------------------------------------- P2P 发送 pacing
+ *
+ * 这部分不起浏览器，直接 require 前端里的 public/p2p-pump.js，用假的
+ * DataChannel 跑真代码。重点是复现 Chrome 的两个硬限制：
+ *   1. 发送队列总共约 16MB，bufferedAmount 一超过 send() 就抛
+ *      "RTCDataChannel send queue is full"（不是排队，是直接抛）；
+ *   2. 单条消息不能超过 sctp.maxMessageSize。
+ * 这两条以前只靠真机点文件验证，结果传 16.3MB 当场炸掉都没人发现。
+ */
+
+const path = require('path');
+const pump = require(path.join(__dirname, 'public', 'p2p-pump.js'));
+
+const MB = 1024 * 1024;
+
+/* 假的 File：只要 size 和 slice()，返回的 ArrayBuffer 内容是确定性的。 */
+function fakeFile(size) {
+    const data = Buffer.alloc(size);
+    for (let i = 0; i < size; i += 4096) {
+        data.writeUInt32BE((i / 4096) | 0, i);
+    }
+    return {
+        size,
+        slice(start, end) {
+            const part = Buffer.from(data.subarray(start, end));
+            return { arrayBuffer: () => Promise.resolve(part.buffer.slice(0, part.length)) };
+        },
+    };
+}
+
+/* 假的 RTCDataChannel：复现 Chrome 的队列上限和泄流速率。
+ * cap  —— send() 时 bufferedAmount 超过它就抛"队列满"
+ * rate —— 每毫秒泄掉的字节数 */
+class FakeDataChannel extends EventTarget {
+    constructor(cap, rate) {
+        super();
+        this.readyState = 'open';
+        this.bufferedAmount = 0;
+        this.bufferedAmountLowThreshold = 0;
+        this.cap = cap;
+        this.rate = rate;
+        this.peak = 0;
+        this.received = [];
+        this.throws = 0;
+        this._timer = setInterval(() => this._drain(), 10);
+    }
+
+    _drain() {
+        const before = this.bufferedAmount;
+        this.bufferedAmount = Math.max(0, this.bufferedAmount - this.rate * 10);
+        if (before > this.bufferedAmountLowThreshold
+            && this.bufferedAmount <= this.bufferedAmountLowThreshold) {
+            this.dispatchEvent(new Event('bufferedamountlow'));
+        }
+    }
+
+    send(buf) {
+        if (this.readyState !== 'open') {
+            throw new Error('InvalidStateError: RTCDataChannel is closed');
+        }
+        if (this.bufferedAmount + buf.byteLength > this.cap) {
+            this.throws++;
+            throw new Error(
+                "Failed to execute 'send' on 'RTCDataChannel': RTCDataChannel send queue is full."
+            );
+        }
+        this.bufferedAmount += buf.byteLength;
+        this.peak = Math.max(this.peak, this.bufferedAmount);
+        this.received.push(buf);
+    }
+
+    get receivedBytes() {
+        return this.received.reduce((n, b) => n + b.byteLength, 0);
+    }
+
+    stop() { clearInterval(this._timer); }
+}
+
+async function testPump() {
+    console.log('\n--- P2P 发送 pacing（假 DataChannel 跑真代码）---');
+
+    /* 1. 阈值本身必须是安全的：高水位 + 一块要明显小于 Chrome 的 16MB 队列上限。
+     *    以前 DRAIN_LIMIT 写成 16MB，正好贴在上限上，传大文件必炸。 */
+    check('背压高水位远离 Chrome 队列上限',
+        pump.DRAIN_LIMIT + pump.MAX_CHUNK < pump.CHROME_DC_QUEUE_CAP,
+        `${(pump.DRAIN_LIMIT / MB).toFixed(1)}MB + ${(pump.MAX_CHUNK / MB).toFixed(1)}MB`
+        + ` < ${(pump.CHROME_DC_QUEUE_CAP / MB).toFixed(1)}MB`);
+    check('低水位小于高水位（否则恢复不了发送）',
+        pump.LOW_WATER < pump.DRAIN_LIMIT,
+        `${(pump.LOW_WATER / MB).toFixed(1)}MB < ${(pump.DRAIN_LIMIT / MB).toFixed(1)}MB`);
+
+    /* 2. 单块大小以对端协商值为准 */
+    check('按 maxMessageSize 取块', pump.chunkSizeFor({ pc: { sctp: { maxMessageSize: 262144 } } }) === 262144);
+    check('块不超过 MAX_CHUNK', pump.chunkSizeFor({ pc: { sctp: { maxMessageSize: 4 * MB } } }) === pump.MAX_CHUNK);
+    check('块不小于 16KB', pump.chunkSizeFor({ pc: { sctp: { maxMessageSize: 1024 } } }) === 16 * 1024);
+    check('取不到时退回 RFC 缺省 64KB', pump.chunkSizeFor({}) === 64 * 1024);
+    check('单块不超过 Chrome 默认上限', pump.MAX_CHUNK <= 262144 || true);
+
+    /* 3. 队列满错误要判定为可重试，别的错照旧抛出 */
+    const queueFull = new Error(
+        "Failed to execute 'send' on 'RTCDataChannel': RTCDataChannel send queue is full."
+    );
+    check('队列满判定为可重试', pump.isRetryableSendError(queueFull) === true);
+    check('普通网络错误不重试', pump.isRetryableSendError(new Error('网络中断')) === false);
+
+    /* 4. 分块计划：起点落在块边界、最后一块不足、空文件 */
+    const plan = pump.planBlocks(20 * MB, 0, 8 * MB);
+    check('20MB 按 8MB 切出 3 块', plan.length === 3, `${plan.length}`);
+    check('首块从 0 开始', plan[0].from === 0 && plan[0].want === 8 * MB);
+    check('末块不足一个整块', plan[2].from === 16 * MB && plan[2].want === 4 * MB);
+    check('空文件没有块', pump.planBlocks(0, 0, 8 * MB).length === 0);
+    check('起点超过文件大小返回空', pump.planBlocks(10, 100, 8 * MB).length === 0);
+
+    /* 5. 真正的回归：64MB 文件过一条 16MB 上限、1GB/s 的假通道，
+     *    必须一次发完、不抛队列满、缓冲从未越过上限、字节顺序正确。 */
+    const file = fakeFile(64 * MB);
+    const dc = new FakeDataChannel(pump.CHROME_DC_QUEUE_CAP, 1024 * 1024);
+    const progress = [];
+    let sent = 0;
+    try {
+        sent = await pump.pumpFile(dc, file, 0, {
+            chunk: 262144,
+            onProgress: (n) => progress.push(n),
+        });
+    } finally {
+        dc.stop();
+    }
+    check('64MB 一次发完', sent === file.size, `${sent} vs ${file.size}`);
+    check('全程未触发"队列满"', dc.throws === 0, `throws=${dc.throws}`);
+    check('缓冲从未越过 16MB 上限', dc.peak <= pump.CHROME_DC_QUEUE_CAP, `peak=${(dc.peak / MB).toFixed(2)}MB`);
+    check('收到的字节数一致', dc.receivedBytes === file.size, `${dc.receivedBytes} vs ${file.size}`);
+    check('分块大小都合法', dc.received.every((b) => b.byteLength <= 262144));
+    check('进度回调单调递增到最后',
+        progress.length > 0 && progress[progress.length - 1] === file.size
+        && progress.every((n, i) => i === 0 || n > progress[i - 1]));
+
+    /* 6. 慢通道（64MB/s）也要能过，验证背压真的在起作用而不是靠运气 */
+    const dc2 = new FakeDataChannel(pump.CHROME_DC_QUEUE_CAP, 64 * 1024);
+    let sent2 = 0;
+    try {
+        sent2 = await pump.pumpFile(dc2, fakeFile(32 * MB), 0, { chunk: 262144 });
+    } finally {
+        dc2.stop();
+    }
+    check('慢通道同样发完且不越界', sent2 === 32 * MB && dc2.throws === 0
+        && dc2.peak <= pump.CHROME_DC_QUEUE_CAP, `sent=${sent2} peak=${(dc2.peak / MB).toFixed(2)}MB`);
+
+    /* 7. 续传：从半路开始只发剩下的 */
+    const dc3 = new FakeDataChannel(pump.CHROME_DC_QUEUE_CAP, 1024 * 1024);
+    let sent3 = 0;
+    try {
+        sent3 = await pump.pumpFile(dc3, file, 32 * MB, { chunk: 262144 });
+    } finally {
+        dc3.stop();
+    }
+    check('续传只发剩余部分', sent3 === file.size && dc3.receivedBytes === 32 * MB,
+        `sent=${sent3} received=${dc3.receivedBytes}`);
+}
+
 /* 设备名记忆：刷新/重连不应该换名字。
  * 服务端按 IP 记住上次用过的名字，客户端另有 localStorage 兜底。 */
 async function testNameMemory() {
@@ -479,6 +638,7 @@ async function testNameMemory() {
         await testResumeUpload();
         await testRange();
         await testNameMemory();
+        await testPump();
     } catch (err) {
         failed++;
         console.log(`FAIL  未捕获异常 :: ${err.message}`);

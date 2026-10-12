@@ -14,6 +14,8 @@
 
 两条路径都支持断点续传：直传中断后重发会接着上次的字节偏移继续；文件库上传按偏移续写 `.part` 半成品；下载走 HTTP Range，浏览器原生续传。设备名在浏览器本地存一份、服务端再按 IP 记一份，刷新页面、重连都不会变回随机名。
 
+**关于速度**：P2P 直传走 WebRTC DataChannel，有两条浏览器硬限制——单条消息不能超过 `sctp.maxMessageSize`（Chrome 默认 256KB），发送队列总共只有约 16MB，`bufferedAmount` 一超过 `send()` 就直接抛 `RTCDataChannel send queue is full`（不是排队，是抛异常）。 pacing 逻辑集中在 `public/p2p-pump.js`，高水位取 4MB、离上限留足余量，并且一次读 8MB 再切块发送，避免每 256KB 就走一次 Blob IPC 把带宽卡在读速上。
+
 ## 运行
 
 ```bash
@@ -42,9 +44,10 @@ Windows 双击 `start.bat` 即可。
 
 - **零第三方依赖**。WebSocket 服务端是按 RFC 6455 自己实现的握手与帧编解码，不装 `ws`；上传用裸请求体流式落盘，不装 `multer`/`busboy`。`npm install` 什么都不用装。
 - **不配 STUN/TURN**。纯内网场景下 WebRTC 用本机内网 IP 的 host candidate 就能直连，因此完全离线可用。
-- **分块 + 背压 + 预读**。切片取 `RTCSctpTransport.maxMessageSize` 与 256 KB 的较小值（Chrome 默认 256 KB，比旧的 64 KB 快一个量级）；`bufferedAmount` 超过 16 MB 才暂停、降到 4 MB 恢复——阈值太小会频繁空等，这是"只有 1 MB/s"的主因。发送循环还提前 `await` 下一个分片，避免每块都串行等一次磁盘读取。
+- **分块 + 背压 + 预读**。切片取 `RTCSctpTransport.maxMessageSize` 与 1 MB 的较小值（Chrome 默认 256 KB，比旧的 64 KB 快一个量级）；背压高水位 4 MB、低水位 1 MB。**高水位不要往 16 MB 调**——Chrome 的 DataChannel 发送队列总共只有约 16 MB，`bufferedAmount` 一超过，`send()` 不是排队而是直接抛 `RTCDataChannel send queue is full`，整次传输当场判死（本机实测 16.3 MB 处必现）。发送前一次读 8 MB 再切块，避免每块都串行等一次磁盘读取。
 - **断点续传**。直传按 `name|size|lastModified` 生成 `fileId`，中断时记下已收偏移，重发时接收端回 `offset` 从断点继续；文件库上传按 4 MB 分块带 `offset` 续写 `.part`，先查 `/api/upload-status` 定位起点；下载由 HTTP Range 提供。
 - **设备名持久化**。浏览器端存 `localStorage`，服务端按 IP 记住上次的名字，刷新和重连都保持。
+- **pacing 单独一个文件**。`public/p2p-pump.js` 用 UMD 包了一层，Node 里可以直接 `require`；测试用假 DataChannel 复现 Chrome 的 16 MB 队列上限来跑真代码——背压阈值这类边界靠真机点文件是点不出来的。
 - **串行传输**。同一时间只传一个文件，接收端不需要区分数据块归属。
 - **文件名安全**。上传前剥离路径、过滤控制字符，并校验最终路径仍在存储目录内，防止目录穿越。
 
@@ -54,7 +57,7 @@ Windows 双击 `start.bat` 即可。
 npm test
 ```
 
-`test.js` 会自己拉起服务、跑完 57 项断言再关闭它，覆盖：
+`test.js` 会自己拉起服务、跑完 79 项断言再关闭它，覆盖：
 
 - 静态托管、目录穿越防护（明文与编码两种）
 - 上传 / 下载 / 删除、中文与特殊文件名往返、同名自动重命名
@@ -63,6 +66,9 @@ npm test
 - **上传断点续传**：分块写入、未完结不进文件库、`/api/upload-status` 查进度、续传后内容逐字节一致、跳过未上传区域返回 409
 - **下载 Range**：`Accept-Ranges: bytes`、206 + `Content-Range`、开区间与闭区间内容校验、越界返回 416
 - **设备名记忆**：改名回执、断开重连后名字不变
+- **P2P 发送 pacing**（不起浏览器）：用假 DataChannel 跑 `public/p2p-pump.js` 的真代码，
+  复现 Chrome 那 16MB 发送队列上限，验证 64MB 文件一次发完、不抛"队列满"、
+  缓冲从不越界、慢通道与续传起点都正确
 
 需要 Node ≥ 21（用到全局 `WebSocket`）。也可以手动指定目标：
 
