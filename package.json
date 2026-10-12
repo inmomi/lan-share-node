@@ -1,22 +1,13 @@
 {
-  "name": "lan-share-node",
+  "name": "lan-share",
   "version": "1.0.0",
   "private": true,
   "description": "LAN file sharing: WebRTC peer-to-peer transfer plus optional server-side storage, zero dependencies.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "test": "node test.js"
+    "start": "node server.js"
   },
   "engines": {
-    "node": ">=21"
-  },
-  "keywords": [
-    "lan",
-    "file-sharing",
-    "webrtc",
-    "peer-to-peer",
-    "websocket"
-  ],
-  "license": "MIT"
+    "node": ">=18"
+  }
 }

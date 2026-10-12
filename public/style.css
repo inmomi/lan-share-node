@@ -282,6 +282,20 @@ main {
 
 .t-sub { font-size: 11px; color: var(--faint); }
 
+/* 中断后的「继续」按钮。只在失败/中断的传输行上出现（JS 加 .hidden 控制）。 */
+.t-retry {
+  align-self: flex-start;
+  margin-top: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--blue);
+  background: none;
+  border: 1px solid var(--blue);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.t-retry:hover { background: var(--blue); color: #fff; }
+
 /* --------------------------------------------------------------- vault */
 
 .dropzone {

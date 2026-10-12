@@ -6,9 +6,26 @@
  * - The vault tab uploads to / downloads from the server disk.
  */
 
-const CHUNK = 64 * 1024;
-const DRAIN_LIMIT = 1024 * 1024;
-const LOW_WATER = 256 * 1024;
+/* 传输参数。
+ * 单块取 256KB：Chrome 的 RTCSctpTransport.maxMessageSize 默认 262144，
+ * 超过它 send() 会直接抛错，所以这是硬上限，不能靠调大来提速。
+ *
+ * 真正的提速来自背压阈值。原来 DRAIN_LIMIT=1MB / LOW_WATER=256KB，
+ * 缓冲一过 1MB 就停发、要等降到 256KB 才继续，SCTP 发送窗口常年空着，
+ * 千兆网下实测只有 1MB/s。拉到 16MB / 4MB 后缓冲常驻高位，窗口才填得满。
+ *
+ * 另外每块之间不要串行 await 磁盘读——改成发当前块时预读下一块。 */
+const MAX_CHUNK = 256 * 1024;
+const DRAIN_LIMIT = 16 * 1024 * 1024;
+const LOW_WATER = 4 * 1024 * 1024;
+
+/* 文件库上传的分块大小。走 HTTP，没有 256KB 的限制，取大一点减少往返。 */
+const UP_CHUNK = 4 * 1024 * 1024;
+/* 进度条刷新间隔。原来每收到一块就写一次 DOM，100MB 文件要动 1600 次，
+ * 光重排就把主线程拖住了。改成 120ms 批量刷一次。 */
+const UI_TICK = 120;
+
+const NAME_KEY = 'lanshare.deviceName';
 
 const state = {
   myId: null,
@@ -21,6 +38,10 @@ const state = {
   transfers: new Map(),
   targetPeer: null,
   modalResolve: null,
+  /* 接收方未完成的半成品，按 fileId 存。通道断了不清空，
+   * 对端重发同一个文件时用它里的 received 作为续传起点。 */
+  resume: new Map(),
+  dirty: new Set(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -48,6 +69,35 @@ function humanSize(bytes) {
 function peerName(id) {
   const peer = state.peers.find((p) => p.id === id);
   return peer ? peer.name : '已断开的设备';
+}
+
+/* 设备名持久化。
+ * 服务端每次新连接都会重新随机取名，光靠它刷新一次就换一个名字，
+ * 对端根本认不出这台机器是谁。所以本机记住名字，连上就报给服务端。
+ * 服务端那边另外按 IP 记一层，作为换浏览器/清缓存时的兜底。 */
+function loadSavedName() {
+  try {
+    return localStorage.getItem(NAME_KEY) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function saveName(name) {
+  try {
+    localStorage.setItem(NAME_KEY, name);
+  } catch (_) {
+    /* 隐私模式下写不了 localStorage，名字这次会话内有效即可 */
+  }
+}
+
+/** 续传的标识：同名同大小才算同一个文件。带 lastModified 防止文件内容变了却续上。 */
+function fileIdOf(name, size, lastModified) {
+  return `${name}|${size}|${lastModified || 0}`;
+}
+
+function humanSpeed(bytesPerSecond) {
+  return `${humanSize(bytesPerSecond)}/s`;
 }
 
 /* ------------------------------------------------------------------ toasts */
@@ -90,7 +140,12 @@ function connect() {
   ws = new WebSocket(`${proto}//${location.host}/ws`);
 
   ws.addEventListener('open', () => {
-    if (state.myName) send({ type: 'rename', name: state.myName });
+    const saved = loadSavedName();
+    if (saved) {
+      state.myName = saved;
+      if (document.activeElement !== $('myName')) $('myName').value = saved;
+      send({ type: 'rename', name: saved });
+    }
   });
 
   ws.addEventListener('message', (event) => {
@@ -102,8 +157,18 @@ function connect() {
     }
     if (msg.type === 'self') {
       state.myId = msg.id;
-      state.myName = msg.name;
-      if (document.activeElement !== $('myName')) $('myName').value = msg.name;
+      const saved = loadSavedName();
+      if (saved) {
+        /* 本机定过的名字优先，服务端给的随机名不能覆盖它 */
+        state.myName = saved;
+        if (document.activeElement !== $('myName')) $('myName').value = saved;
+        if (msg.name !== saved) send({ type: 'rename', name: saved });
+      } else {
+        /* 第一次来：接受服务端名字并记住，此后刷新就一直是它 */
+        state.myName = msg.name;
+        saveName(msg.name);
+        if (document.activeElement !== $('myName')) $('myName').value = msg.name;
+      }
       renderPeers();
     } else if (msg.type === 'peers') {
       state.peers = msg.peers.filter((p) => p.id !== state.myId);
@@ -149,6 +214,7 @@ function getConn(peerId) {
 
   pc.addEventListener('connectionstatechange', () => {
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      markInterrupted();
       state.conns.delete(peerId);
       renderPeers();
     } else {
@@ -169,6 +235,7 @@ function attachChannel(conn, dc) {
   });
   dc.addEventListener('message', (event) => onChannelMessage(conn, event.data));
   dc.addEventListener('close', () => {
+    markInterrupted();
     state.conns.delete(conn.peerId);
     renderPeers();
   });
@@ -238,50 +305,87 @@ function waitDrain(dc) {
   });
 }
 
+/** 对端回应接收请求。resolve 出 { ok, offset }，offset 是对方已收到的字节数。 */
 function waitAccept(tid) {
   return new Promise((resolve) => {
     state.pendingAccept.set(tid, resolve);
     setTimeout(() => {
       if (state.pendingAccept.has(tid)) {
         state.pendingAccept.delete(tid);
-        resolve(false);
+        resolve({ ok: false, offset: 0 });
       }
     }, 60000);
   });
 }
 
+/** 单块大小。Chrome 的 sctp.maxMessageSize 默认 262144，超过 send() 会直接抛错。 */
+function chunkSizeFor(conn) {
+  const cap = conn.pc && conn.pc.sctp ? conn.pc.sctp.maxMessageSize : 0;
+  if (!cap || !Number.isFinite(cap)) return MAX_CHUNK;
+  return Math.max(16 * 1024, Math.min(MAX_CHUNK, cap));
+}
+
 async function sendOne(peerId, file) {
   const conn = await ensureChannel(peerId);
   const tid = makeId();
-  addTransfer({
-    tid, name: file.name, size: file.size, dir: 'up', peerId,
+  const fileId = fileIdOf(file.name, file.size, file.lastModified);
+  const chunk = chunkSizeFor(conn);
+
+  const rec = addTransfer({
+    tid,
+    name: file.name,
+    size: file.size,
+    dir: 'up',
+    peerId,
+    peerLabel: peerName(peerId),
+    file,
+    retry: () => enqueueSend(peerId, file),
   });
+  rec.fileId = fileId;
 
-  conn.dc.send(JSON.stringify({ t: 'file-offer', tid, name: file.name, size: file.size }));
+  conn.dc.send(JSON.stringify({
+    t: 'file-offer', tid, fileId, name: file.name, size: file.size,
+  }));
 
-  const ok = await waitAccept(tid);
-  if (!ok) {
+  const accept = await waitAccept(tid);
+  if (!accept.ok) {
     updateTransfer(tid, { status: '对方拒绝', failed: true });
     return;
   }
 
-  updateTransfer(tid, { status: '传输中' });
-  let offset = 0;
+  let offset = accept.offset || 0;
+  if (offset > file.size) offset = 0;
+  updateTransfer(tid, {
+    sent: offset,
+    status: offset > 0 ? `续传中（已收 ${humanSize(offset)}）` : '传输中',
+  });
+
+  /* 预读流水线：发当前块的同时把下一块从磁盘读出来。
+   * 原来每块都是 `读 -> 等缓冲 -> 发` 三步串行，磁盘 I/O 和发送互相干等，
+   * 千兆网下光等就吃掉大半时间。 */
+  let pending = file.slice(offset, offset + chunk).arrayBuffer();
   while (offset < file.size) {
-    const slice = file.slice(offset, offset + CHUNK);
-    const buf = await slice.arrayBuffer();
+    const buf = await pending;
+    const next = offset + buf.byteLength;
+    if (next < file.size) pending = file.slice(next, next + chunk).arrayBuffer();
+
     await waitDrain(conn.dc);
     if (conn.dc.readyState !== 'open') throw new Error('连接中断');
     conn.dc.send(buf);
-    offset += buf.byteLength;
-    updateTransfer(tid, { sent: offset });
+    offset = next;
+    updateTransfer(tid, { sent: offset, status: '传输中' });
   }
-  conn.dc.send(JSON.stringify({ t: 'file-end', tid }));
+
+  conn.dc.send(JSON.stringify({ t: 'file-end', tid, fileId }));
   updateTransfer(tid, { status: '已送达', sent: file.size, done: true });
 }
 
 function enqueueSend(peerId, file) {
   state.queue = state.queue.then(() => sendOne(peerId, file)).catch((err) => {
+    const rec = [...state.transfers.values()].reverse().find(
+      (r) => r.file === file && !r.done
+    );
+    if (rec) updateTransfer(rec.tid, { status: `发送失败：${err.message}`, failed: true });
     toast(`发送「${file.name}」失败：${err.message}`);
   });
 }
@@ -300,7 +404,7 @@ function onChannelMessage(conn, data) {
       const resolve = state.pendingAccept.get(msg.tid);
       if (resolve) {
         state.pendingAccept.delete(msg.tid);
-        resolve(msg.t === 'file-accept');
+        resolve({ ok: msg.t === 'file-accept', offset: Number(msg.offset) || 0 });
       }
       if (msg.t === 'file-reject') toast('对方拒绝了接收');
     } else if (msg.t === 'file-end') {
@@ -320,27 +424,65 @@ function onChannelMessage(conn, data) {
 
 async function askReceive(conn, msg) {
   const from = peerName(conn.peerId);
-  const accepted = await confirmDialog(
-    '收到传输请求',
-    `${from} 想发送「${msg.name}」(${humanSize(msg.size)})`
-  );
+  /* 同一个文件之前收到一半就断了：用已收字节数作为续传起点，
+   * 让对端从断点接着发，而不是从 0 重来。 */
+  const prior = msg.fileId ? state.resume.get(msg.fileId) : null;
+  const already = prior ? prior.received : 0;
+
+  let accepted;
+  if (already > 0 && already < msg.size) {
+    accepted = await confirmDialog(
+      '继续接收',
+      `${from} 继续发送「${msg.name}」(${humanSize(msg.size)})，`
+        + `本机已收到 ${humanSize(already)}，将从断点续传。`
+    );
+  } else {
+    accepted = await confirmDialog(
+      '收到传输请求',
+      `${from} 想发送「${msg.name}」(${humanSize(msg.size)})`
+    );
+  }
   if (!accepted) {
     conn.dc.send(JSON.stringify({ t: 'file-reject', tid: msg.tid }));
     return;
   }
-  state.incoming = {
-    tid: msg.tid, name: msg.name, size: msg.size, from, chunks: [], received: 0,
-  };
-  addTransfer({ tid: msg.tid, name: msg.name, size: msg.size, dir: 'down', peerId: conn.peerId });
-  updateTransfer(msg.tid, { status: '接收中' });
-  conn.dc.send(JSON.stringify({ t: 'file-accept', tid: msg.tid }));
+
+  const inc = (prior && already < msg.size)
+    ? prior
+    : { tid: msg.tid, fileId: msg.fileId, name: msg.name, size: msg.size, from, chunks: [], received: 0 };
+  inc.tid = msg.tid;
+  state.incoming = inc;
+  if (inc.fileId) state.resume.set(inc.fileId, inc);
+
+  addTransfer({
+    tid: msg.tid, name: msg.name, size: msg.size, dir: 'down', peerId: conn.peerId, peerLabel: from,
+  });
+  updateTransfer(msg.tid, { status: '接收中', sent: inc.received });
+  conn.dc.send(JSON.stringify({
+    t: 'file-accept', tid: msg.tid, fileId: msg.fileId, offset: inc.received,
+  }));
+}
+
+/** 通道中途断开：保留已收到的分块，等对方重发同一个文件后续上。 */
+function markInterrupted() {
+  const inc = state.incoming;
+  if (!inc) return;
+  state.incoming = null;
+  if (inc.fileId && inc.received > 0 && inc.received < inc.size) {
+    state.resume.set(inc.fileId, inc);
+    updateTransfer(inc.tid, { status: `已中断（${humanSize(inc.received)}），可续传`, failed: true });
+  } else {
+    updateTransfer(inc.tid, { status: '已中断', failed: true });
+  }
 }
 
 function finishReceive() {
   const inc = state.incoming;
   state.incoming = null;
   if (!inc) return;
+  state.resume.delete(inc.fileId);
   const blob = new Blob(inc.chunks, { type: 'application/octet-stream' });
+  inc.chunks.length = 0;
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -359,28 +501,78 @@ function addTransfer(info) {
   const el = document.createElement('div');
   el.className = 'transfer';
   el.innerHTML = '<div class="t-head"><span class="t-name"></span><span class="t-status"></span></div>'
-    + '<div class="bar"><i></i></div><div class="t-sub"></div>';
+    + '<div class="bar"><i></i></div><div class="t-sub"></div>'
+    + '<button class="mini t-retry hidden">继续</button>';
   el.querySelector('.t-name').textContent = info.name;
   $('transferList').prepend(el);
-  const rec = { el, size: info.size, sent: 0, status: '准备中', dir: info.dir, peerId: info.peerId };
+
+  const rec = {
+    tid: info.tid,
+    el,
+    size: info.size,
+    sent: 0,
+    status: '准备中',
+    dir: info.dir,
+    peerId: info.peerId || null,
+    peerLabel: info.peerLabel || '',
+    file: info.file || null,
+    retry: info.retry || null,
+    speed: 0,
+  };
   state.transfers.set(info.tid, rec);
+  el.querySelector('.t-retry').addEventListener('click', () => {
+    if (rec.retry) rec.retry();
+  });
   updateTransfer(info.tid, {});
   return rec;
 }
 
+/* 进度更新改成节流。原来每收/发一块就写一次 DOM，100MB 的文件要动一千多次，
+ * 光重排就把主线程占住了，反而拖慢传输。统一 120ms 批量刷一次。 */
 function updateTransfer(tid, patch) {
   const rec = state.transfers.get(tid);
   if (!rec) return;
   Object.assign(rec, patch);
+
+  if (typeof patch.sent === 'number') {
+    const now = Date.now();
+    if (!rec.lastTs) {
+      rec.lastTs = now;
+      rec.lastSent = rec.sent;
+    } else {
+      const dt = (now - rec.lastTs) / 1000;
+      if (dt >= 0.4) {
+        rec.speed = Math.max(0, (rec.sent - rec.lastSent) / dt);
+        rec.lastTs = now;
+        rec.lastSent = rec.sent;
+      }
+    }
+  }
+  state.dirty.add(tid);
+}
+
+function renderTransfer(tid) {
+  const rec = state.transfers.get(tid);
+  if (!rec) return;
   const pct = rec.size ? Math.min(100, Math.round((rec.sent / rec.size) * 100)) : (rec.done ? 100 : 0);
+  const who = rec.peerLabel || (rec.peerId ? peerName(rec.peerId) : '');
+  const speed = rec.speed > 0 ? ` · ${humanSpeed(rec.speed)}` : '';
+
   rec.el.querySelector('.bar i').style.width = `${pct}%`;
   rec.el.querySelector('.t-status').textContent = rec.status || `${pct}%`;
   rec.el.querySelector('.t-sub').textContent = rec.dir === 'down'
-    ? `来自 ${peerName(rec.peerId)} · ${humanSize(rec.sent)} / ${humanSize(rec.size)}`
-    : `发往 ${peerName(rec.peerId)} · ${humanSize(rec.sent)} / ${humanSize(rec.size)}`;
+    ? `来自 ${who} · ${humanSize(rec.sent)} / ${humanSize(rec.size)}${speed}`
+    : `发往 ${who} · ${humanSize(rec.sent)} / ${humanSize(rec.size)}${speed}`;
   rec.el.classList.toggle('done', Boolean(rec.done));
   rec.el.classList.toggle('fail', Boolean(rec.failed));
+  rec.el.querySelector('.t-retry').classList.toggle('hidden', !(rec.failed && rec.retry));
 }
+
+setInterval(() => {
+  if (!state.dirty.size) return;
+  for (const tid of state.dirty) renderTransfer(tid);
+  state.dirty.clear();
+}, UI_TICK);
 
 /* ------------------------------------------------------------------ peers */
 
@@ -462,6 +654,7 @@ $('myName').addEventListener('change', (event) => {
     return;
   }
   state.myName = value;
+  saveName(value);
   send({ type: 'rename', name: value });
 });
 
@@ -512,27 +705,98 @@ async function refreshVault() {
   }
 }
 
-function uploadFiles(files) {
-  for (const file of files) {
+/** 上传单个分块。服务端按 offset 顺序落进 .part 文件，中断后 .part 保留。 */
+function putChunk(name, size, offset, blob) {
+  return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/upload?name=${encodeURIComponent(file.name)}`);
-    xhr.upload.addEventListener('progress', (event) => {
-      if (event.lengthComputable && event.loaded === event.total) toast(`已上传「${file.name}」`);
-    });
+    xhr.open('POST', `/api/upload?name=${encodeURIComponent(name)}&size=${size}&offset=${offset}`);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.addEventListener('load', () => {
       if (xhr.status === 200) {
-        refreshVault();
-      } else {
-        let reason = xhr.statusText;
         try {
-          reason = JSON.parse(xhr.responseText).error || reason;
-        } catch (_) { /* keep status text */ }
-        toast(`上传失败：${reason}`);
+          resolve(JSON.parse(xhr.responseText));
+        } catch (_) {
+          resolve({ ok: true });
+        }
+        return;
       }
+      let reason = xhr.statusText;
+      try {
+        reason = JSON.parse(xhr.responseText).error || reason;
+      } catch (_) { /* 保持 statusText */ }
+      reject(new Error(reason || `HTTP ${xhr.status}`));
     });
-    xhr.addEventListener('error', () => toast(`上传失败：${file.name}`));
-    xhr.send(file);
+    xhr.addEventListener('error', () => reject(new Error('网络中断')));
+    xhr.addEventListener('abort', () => reject(new Error('上传被取消')));
+    xhr.send(blob);
+  });
+}
+
+async function uploadOne(file) {
+  const tid = makeId();
+  addTransfer({
+    tid,
+    name: file.name,
+    size: file.size,
+    dir: 'up',
+    peerId: null,
+    peerLabel: '服务端',
+    file,
+    retry: () => uploadOne(file),
+  });
+
+  let offset = 0;
+  try {
+    /* 开传前先问一句：这个文件服务端已经收了多少字节。
+     * 上次传一半断掉的话，就从那个位置接着传，不用从头再来。 */
+    const st = await fetch(
+      `/api/upload-status?name=${encodeURIComponent(file.name)}&size=${file.size}`,
+      { cache: 'no-store' }
+    ).then((r) => r.json());
+    offset = Math.max(0, Math.min(Number(st.received) || 0, file.size));
+  } catch (_) {
+    offset = 0;
   }
+
+  updateTransfer(tid, {
+    sent: offset,
+    status: offset > 0 ? `续传中（已收 ${humanSize(offset)}）` : '上传中',
+  });
+
+  try {
+    if (file.size === 0) {
+      await putChunk(file.name, 0, 0, file.slice(0, 0));
+      updateTransfer(tid, { status: '已上传', sent: 0, done: true });
+      refreshVault();
+      return;
+    }
+    while (offset < file.size) {
+      const end = Math.min(offset + UP_CHUNK, file.size);
+      const res = await putChunk(file.name, file.size, offset, file.slice(offset, end));
+      offset = end;
+      /* 收满时服务端把 .part 重命名成正式文件，可能因为重名加了个 (1) */
+      if (res && res.done && res.name && res.name !== file.name) {
+        updateTransfer(tid, { status: `已保存为「${res.name}」`, sent: file.size, done: true });
+        toast(`已上传「${file.name}」→「${res.name}」`);
+        refreshVault();
+        return;
+      }
+      updateTransfer(tid, { sent: offset, status: '上传中' });
+    }
+    updateTransfer(tid, { status: '已上传', sent: file.size, done: true });
+    toast(`已上传「${file.name}」`);
+    refreshVault();
+  } catch (err) {
+    updateTransfer(tid, {
+      status: `上传失败：${err.message}（已收 ${humanSize(offset)}，可继续）`,
+      failed: true,
+    });
+    toast(`上传「${file.name}」失败：${err.message}`);
+  }
+}
+
+function uploadFiles(files) {
+  for (const file of files) uploadOne(file);
 }
 
 $('pickVault').addEventListener('click', () => $('vaultPicker').click());

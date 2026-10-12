@@ -38,6 +38,21 @@ function check(name, cond, extra) {
     }
 }
 
+/* Windows 上 shell:true 走的是 cmd.exe，"./lan-share" 这种 Unix 写法会被拆成
+ * "." + "/lan-share"，cmd 报「'.' 不是内部或外部命令」。这里做一次规范化：
+ * 去掉前导 "./"，无扩展名时补 .exe（若存在），让同一条 SPAWN 在两种系统下都能用。 */
+function normalizeSpawn(cmd) {
+    if (process.platform !== 'win32') return cmd;
+    const parts = cmd.split(/\s+/);
+    let exe = parts[0];
+    if (exe.startsWith('./') || exe.startsWith('.\\')) exe = exe.slice(2);
+    if (!/\.(exe|bat|cmd)$/i.test(exe) && require('fs').existsSync(exe + '.exe')) {
+        exe += '.exe';
+    }
+    parts[0] = exe;
+    return parts.join(' ');
+}
+
 /* SPAWN 模式下等待服务端口就绪，最多等 20 秒 */
 async function waitReady(host, port, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
@@ -59,7 +74,7 @@ async function waitReady(host, port, timeoutMs) {
 /* 发一个 HTTP 请求，返回 { status, headers, body(Buffer) }。
  * 注意：http.request 不会规范化 path，所以 '/../x' 会原样发到服务端，
  * 这正是测试目录穿越所需要的。 */
-function req(method, path, body) {
+function req(method, path, body, extraHeaders) {
     return new Promise((resolve, reject) => {
         const r = http.request(
             {
@@ -67,9 +82,10 @@ function req(method, path, body) {
                 port: base.port || 80,
                 method,
                 path,
-                headers: body
-                    ? { 'Content-Length': Buffer.byteLength(body) }
-                    : {},
+                headers: {
+                    ...(extraHeaders || {}),
+                    ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
+                },
             },
             (res) => {
                 const chunks = [];
@@ -89,8 +105,8 @@ function req(method, path, body) {
     });
 }
 
-const json = async (method, path, body) => {
-    const r = await req(method, path, body);
+const json = async (method, path, body, extraHeaders) => {
+    const r = await req(method, path, body, extraHeaders);
     try {
         return { ...r, json: JSON.parse(r.body.toString('utf8')) };
     } catch {
@@ -297,11 +313,142 @@ async function testWebSocket() {
     a.ws.close();
 }
 
+/* 造一段伪随机数据，避免全零内容掩盖截断/错位问题 */
+function pseudoBytes(size, seed) {
+    const buf = Buffer.alloc(size);
+    let x = seed;
+    for (let i = 0; i < size; i++) {
+        x = (x * 1103515245 + 12345) & 0x7fffffff;
+        buf[i] = x & 0xff;
+    }
+    return buf;
+}
+
+/* 分块上传 + 中断 + 续传。核心断言是"续完之后内容逐字节一致"：
+ * 续传最容易错的就是偏移量，错了文件能落盘但内容是坏的。 */
+async function testResumeUpload() {
+    console.log('\n--- 断点续传（文件库分块上传）---');
+    const name = 'resume-me.bin';
+    const total = 300 * 1024;
+    const data = pseudoBytes(total, 987654321);
+    const enc = encodeURIComponent(name);
+    await json('DELETE', '/api/files?name=' + enc);
+
+    const r1 = await json('POST', `/api/upload?name=${enc}&size=${total}&offset=0`,
+        data.subarray(0, 100 * 1024));
+    check('首块上传返回未完结', r1.json && r1.json.ok === true && r1.json.done === false,
+        JSON.stringify(r1.json));
+    check('首块后已收字节正确', r1.json && r1.json.received === 100 * 1024,
+        `${r1.json && r1.json.received}`);
+
+    const mid = await json('GET', '/api/files');
+    check('未完结时不出现在文件库',
+        mid.json && mid.json.files.filter((f) => f.name === name).length === 0);
+
+    const st = await json('GET', `/api/upload-status?name=${enc}&size=${total}`);
+    check('进度查询返回已收字节', st.json && st.json.received === 100 * 1024,
+        `${st.json && st.json.received}`);
+
+    const r2 = await json('POST', `/api/upload?name=${enc}&size=${total}&offset=${100 * 1024}`,
+        data.subarray(100 * 1024, 200 * 1024));
+    check('第二块续传成功', r2.json && r2.json.ok === true && r2.json.done === false,
+        JSON.stringify(r2.json));
+
+    const r3 = await json('POST', `/api/upload?name=${enc}&size=${total}&offset=${200 * 1024}`,
+        data.subarray(200 * 1024));
+    check('最后一块收满并落定', r3.json && r3.json.ok === true && r3.json.done === true,
+        JSON.stringify(r3.json));
+
+    const dl = await req('GET', '/api/download?name=' + enc);
+    check('续传后内容逐字节一致', dl.body.equals(data), `${dl.body.length} vs ${total}`);
+    await json('DELETE', '/api/files?name=' + enc);
+
+    /* 客户端跳到还没收到的位置：顺序写做不到，必须报错让它按实际进度重来，
+     * 否则会产出一个中间空洞的文件。 */
+    const bad = await json('POST', '/api/upload?name=jump.bin&size=1000&offset=500',
+        Buffer.alloc(10));
+    check('跳过未上传区域返回 409', bad.status === 409, `status=${bad.status}`);
+}
+
+/* HTTP Range：浏览器与下载器的断点续传依赖它 */
+async function testRange() {
+    console.log('\n--- 下载断点续传（HTTP Range）---');
+    const name = 'range-src.bin';
+    const total = 64 * 1024;
+    const data = pseudoBytes(total, 55555);
+    await json('POST', '/api/upload?name=' + name, data);
+
+    const full = await req('GET', '/api/download?name=' + name);
+    check('全量下载宣告支持 Range', full.headers['accept-ranges'] === 'bytes',
+        full.headers['accept-ranges']);
+
+    const start = 16 * 1024;
+    const r = await req('GET', '/api/download?name=' + name, null, { Range: `bytes=${start}-` });
+    check('Range 请求返回 206', r.status === 206, `status=${r.status}`);
+    check('Content-Range 正确',
+        r.headers['content-range'] === `bytes ${start}-${total - 1}/${total}`,
+        r.headers['content-range']);
+    check('Range 长度正确', r.body.length === total - start, `${r.body.length}`);
+    check('Range 内容逐字节一致', r.body.equals(data.subarray(start)));
+
+    const r2 = await req('GET', '/api/download?name=' + name, null, { Range: 'bytes=10-19' });
+    check('闭区间 Range 长度为 10', r2.body.length === 10, `${r2.body.length}`);
+    check('闭区间 Range 内容一致', r2.body.equals(data.subarray(10, 20)));
+
+    const r3 = await req('GET', '/api/download?name=' + name, null, { Range: `bytes=${total}-` });
+    check('越界 Range 返回 416', r3.status === 416, `status=${r3.status}`);
+
+    await json('DELETE', '/api/files?name=' + name);
+}
+
+/* 设备名记忆：刷新/重连不应该换名字。
+ * 服务端按 IP 记住上次用过的名字，客户端另有 localStorage 兜底。 */
+async function testNameMemory() {
+    console.log('\n--- 设备名记忆（重连不变）---');
+    if (typeof WebSocket === 'undefined') {
+        check('WebSocket 可用（设备名）', false, '需要 Node >= 21');
+        return;
+    }
+    const wsUrl = `ws://${base.hostname}:${base.port || 80}/ws`;
+
+    const openOnce = () => new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl);
+        const inbox = [];
+        ws.addEventListener('message', (e) => inbox.push(JSON.parse(String(e.data))));
+        ws.addEventListener('open', () => resolve({ ws, inbox }));
+        ws.addEventListener('error', reject);
+    });
+    const lastSelf = (inbox) => inbox.filter((m) => m.type === 'self').pop();
+
+    const first = await openOnce();
+    await sleep(250);
+    const self1 = lastSelf(first.inbox);
+    check('首次连接拿到设备名', !!self1 && !!self1.name, self1 && self1.name);
+
+    const myName = '书房的小米笔记本';
+    first.ws.send(JSON.stringify({ type: 'rename', name: myName }));
+    await sleep(300);
+    check('改名后 self 回执更新',
+        (lastSelf(first.inbox) || {}).name === myName,
+        (lastSelf(first.inbox) || {}).name);
+    first.ws.close();
+    await sleep(400);
+
+    /* 同一个 IP 重新连上来，服务端应当还记得这个名字 */
+    const second = await openOnce();
+    await sleep(300);
+    check('重连后设备名保持不变',
+        (lastSelf(second.inbox) || {}).name === myName,
+        `${(lastSelf(second.inbox) || {}).name} vs ${myName}`);
+    second.ws.close();
+    await sleep(200);
+}
+
 (async () => {
     let child = null;
 
     if (process.env.SPAWN) {
-        const cmd = process.env.SPAWN;
+        const cmd = normalizeSpawn(process.env.SPAWN);
         /* 注意第二个参数是 argv 数组、第三个才是 options。
          * 写成 spawn(cmd, { shell: true }) 会把 options 当成 argv，
          * Node 就会把整串 "node server.js" 当作可执行文件路径去找，直接 ENOENT。
@@ -329,6 +476,9 @@ async function testWebSocket() {
         await testUnicode();
         await testBigFile();
         await testWebSocket();
+        await testResumeUpload();
+        await testRange();
+        await testNameMemory();
     } catch (err) {
         failed++;
         console.log(`FAIL  未捕获异常 :: ${err.message}`);

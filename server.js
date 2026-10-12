@@ -20,6 +20,9 @@ const HOST = process.env.HOST || '0.0.0.0';
 const ROOT_DIR = __dirname;
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(ROOT_DIR, 'uploads'));
+/* 断点续传的半成品放在这里。名字是 name|size 的哈希，避开中文/特殊字符的编码坑，
+ * 同时保证同名但不同大小的文件互不干扰。 */
+const PARTS_DIR = path.join(UPLOAD_DIR, '.lanshare-parts');
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -166,6 +169,12 @@ function writeFrame(socket, opcode, data) {
 const clients = new Map(); // id -> { id, name, ip, socket }
 let clientSeq = 0;
 
+/* 按 IP 记住上次用过的设备名。
+ * 浏览器刷新或重连时服务端会重新分配随机名，没有这层记忆的话
+ * 设备名每刷新一次就变一次，对端根本认不出是哪台机器。
+ * 客户端 localStorage 优先，这里只作兜底（比如换浏览器、隐私模式）。 */
+const nameByIp = new Map(); // ip -> 上次使用的名字
+
 const ADJECTIVES = ['蓝色', '银色', '安静', '敏捷', '温暖', '明亮', '沉稳', '轻盈', '清澈', '柔和'];
 const ANIMALS = ['海豚', '猎鹰', '水獭', '狐狸', '鲸鱼', '山猫', '燕子', '小鹿', '海豹', '苍鹭'];
 
@@ -197,7 +206,7 @@ function attachClient(socket, ip) {
   clientSeq += 1;
   const client = {
     id: `dev-${clientSeq}-${crypto.randomBytes(3).toString('hex')}`,
-    name: randomName(),
+    name: nameByIp.get(ip) || randomName(),
     ip,
     socket,
   };
@@ -216,7 +225,10 @@ function attachClient(socket, ip) {
     }
     if (msg.type === 'rename' && typeof msg.name === 'string') {
       const trimmed = msg.name.trim().slice(0, 24);
-      if (trimmed) client.name = trimmed;
+      if (trimmed) {
+        client.name = trimmed;
+        nameByIp.set(client.ip, trimmed);
+      }
       sendTo(client, { type: 'self', id: client.id, name: client.name });
       broadcastPeers();
       return;
@@ -345,9 +357,23 @@ function listFiles(req, res) {
   });
 }
 
-function uploadFile(req, res, url) {
-  const requested = url.searchParams.get('name') || 'unnamed';
-  const name = safeName(requested);
+/** 半成品文件名：name|size 的哈希，避免中文与特殊字符在文件系统上的麻烦。 */
+function partPathFor(name, size) {
+  const key = crypto.createHash('sha1').update(`${name}|${size}`).digest('hex').slice(0, 24);
+  return path.join(PARTS_DIR, `${key}.part`);
+}
+
+function currentReceived(name, size) {
+  try {
+    const stat = fs.statSync(partPathFor(name, size));
+    return size > 0 ? Math.min(stat.size, size) : stat.size;
+  } catch (_) {
+    return 0;
+  }
+}
+
+/** 不带 size/offset 的整包上传：老客户端与测试脚本走这条，行为保持原样。 */
+function uploadWhole(req, res, name) {
   let target;
   try {
     target = uniqueTarget(name);
@@ -370,6 +396,7 @@ function uploadFile(req, res, url) {
       name: path.basename(target),
       size: bytes,
       sizeText: humanSize(bytes),
+      done: true,
     });
   });
   req.on('aborted', () => {
@@ -377,6 +404,88 @@ function uploadFile(req, res, url) {
     fs.unlink(target, () => {});
   });
   req.pipe(stream);
+}
+
+/* 分块上传：客户端带 size 与 offset，服务端把这一块追加进 .part 文件。
+ * 中断时 .part 保留（这是续传的依据，绝不能像整包那样删掉），
+ * 收满 size 后再重命名成正式文件。 */
+function uploadChunk(req, res, name, size, offset) {
+  fs.mkdirSync(PARTS_DIR, { recursive: true });
+  const partPath = partPathFor(name, size);
+  const existing = currentReceived(name, size);
+
+  if (offset > existing) {
+    /* 客户端要跳到还没收到的位置——顺序写做不到，让它按实际进度重来 */
+    sendJson(res, 409, { error: 'offset 超出已接收范围', received: existing });
+    return;
+  }
+
+  let bytes = 0;
+  /* offset 为 0 时用 'w' 重建；否则用 'r+' 就地覆盖，保证断电/重连后
+   * 已落盘的部分不被截断。客户端是顺序写的，不会回头补洞。 */
+  const stream = fs.createWriteStream(partPath, { flags: offset > 0 ? 'r+' : 'w', start: offset });
+  req.on('data', (chunk) => {
+    bytes += chunk.length;
+  });
+  stream.on('error', (err) => {
+    sendJson(res, 500, { error: `写入失败: ${err.message}` });
+  });
+  stream.on('finish', () => {
+    const written = offset + bytes;
+    /* 收满就落定。写成 `size > 0 &&` 的话 0 字节文件永远定不了名，
+     * 分块模式下 size 是必填参数，直接比较即可。 */
+    if (written >= size) {
+      try {
+        const target = uniqueTarget(name);
+        fs.renameSync(partPath, target);
+        sendJson(res, 200, {
+          ok: true,
+          name: path.basename(target),
+          size: written,
+          sizeText: humanSize(written),
+          done: true,
+        });
+      } catch (err) {
+        sendJson(res, 500, { error: `落盘失败: ${err.message}` });
+      }
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true, name, size: written, sizeText: humanSize(written), done: false, received: written,
+    });
+  });
+  req.on('aborted', () => stream.destroy());
+  req.pipe(stream);
+}
+
+function uploadFile(req, res, url) {
+  const requested = url.searchParams.get('name') || 'unnamed';
+  const name = safeName(requested);
+  const sizeParam = url.searchParams.get('size');
+  const offsetParam = url.searchParams.get('offset');
+
+  if (sizeParam === null && offsetParam === null) return uploadWhole(req, res, name);
+
+  const size = Number(sizeParam);
+  const offset = Number(offsetParam) || 0;
+  if (!Number.isFinite(size) || size < 0) {
+    sendJson(res, 400, { error: 'size 无效' });
+    return;
+  }
+  if (!Number.isFinite(offset) || offset < 0) {
+    sendJson(res, 400, { error: 'offset 无效' });
+    return;
+  }
+  uploadChunk(req, res, name, size, offset);
+}
+
+/** 续传前先问一句：这个文件已经收了多少字节。 */
+function uploadStatus(req, res, url) {
+  const name = safeName(url.searchParams.get('name') || '');
+  const size = Number(url.searchParams.get('size')) || 0;
+  sendJson(res, 200, {
+    ok: true, name, size, received: currentReceived(name, size),
+  });
 }
 
 function downloadFile(req, res, url) {
@@ -389,11 +498,38 @@ function downloadFile(req, res, url) {
   }
   const stat = fs.statSync(filePath);
   const encoded = encodeURIComponent(name);
-  res.writeHead(200, {
+  const baseHeaders = {
     'Content-Type': 'application/octet-stream',
-    'Content-Length': stat.size,
     'Content-Disposition': `attachment; filename*=UTF-8''${encoded}`,
-  });
+    'Accept-Ranges': 'bytes',
+  };
+
+  /* Range 支持：浏览器与下载器靠它做断点续传。
+   * 只处理 bytes=start- 这一种，多段区间（逗号分隔）直接忽略走全量。 */
+  const rangeHeader = req.headers.range;
+  const match = rangeHeader ? /^bytes=(\d+)-(\d*)$/.exec(rangeHeader.trim()) : null;
+  if (match) {
+    const start = Number(match[1]);
+    const end = match[2] ? Math.min(Number(match[2]), stat.size - 1) : stat.size - 1;
+    if (start >= stat.size || start > end) {
+      res.writeHead(416, {
+        ...baseHeaders,
+        'Content-Range': `bytes */${stat.size}`,
+        'Content-Length': 0,
+      });
+      res.end();
+      return;
+    }
+    res.writeHead(206, {
+      ...baseHeaders,
+      'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+      'Content-Length': end - start + 1,
+    });
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+    return;
+  }
+
+  res.writeHead(200, { ...baseHeaders, 'Content-Length': stat.size });
   fs.createReadStream(filePath).pipe(res);
 }
 
@@ -419,6 +555,7 @@ const server = http.createServer((req, res) => {
 
   if (pathname === '/api/files' && req.method === 'GET') return listFiles(req, res);
   if (pathname === '/api/upload' && req.method === 'POST') return uploadFile(req, res, url);
+  if (pathname === '/api/upload-status' && req.method === 'GET') return uploadStatus(req, res, url);
   if (pathname === '/api/download' && req.method === 'GET') return downloadFile(req, res, url);
   if (pathname === '/api/files' && req.method === 'DELETE') return deleteFile(req, res, url);
   if (pathname === '/api/info' && req.method === 'GET') {
