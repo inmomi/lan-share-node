@@ -84,25 +84,38 @@
     /** 等发送队列泄到 limit 以下。target 默认 DRAIN_LIMIT；
      *  send() 抛"队列满"之后要用更保守的 LOW_WATER 再等一次，否则重发还是满的。
      *  三种触发都要：bufferedamountlow 事件（正常路径）、50ms 轮询（有的浏览器
-     *  不保证派发这个事件）、以及一个硬超时兜底，别把传输永久卡死。 */
+     *  不保证派发这个事件）、以及一个硬超时兜底，别把传输永久卡死。
+     *
+     *  注意 bufferedAmountLowThreshold 默认是 0：不显式设置的话，
+     *  bufferedamountlow 要等整队泄空才触发，50ms 轮询就成了实际放行手段——
+     *  每轮最多放行一块，吞吐被钉死在 块大小/50ms（256KB 时约 5MB/s），
+     *  链路再快也提不上去。所以等待前先把阈值设成 limit。 */
     function waitDrain(dc, target) {
         const limit = target || DRAIN_LIMIT;
         if (dc.bufferedAmount <= limit) return Promise.resolve();
         return new Promise((resolve) => {
             let done = false;
             let poll = null;
+            let hard = null;
             const finish = () => {
                 if (done) return;
                 done = true;
                 dc.removeEventListener('bufferedamountlow', finish);
                 if (poll) clearInterval(poll);
+                if (hard) clearTimeout(hard);
                 resolve();
             };
+            /* 先挂监听再改阈值，避开"改完阈值事件已经派发完"的竞态 */
             dc.addEventListener('bufferedamountlow', finish);
+            try {
+                if (dc.bufferedAmountLowThreshold !== limit) {
+                    dc.bufferedAmountLowThreshold = limit;
+                }
+            } catch (_) { /* 个别实现该属性只读，靠轮询兜底 */ }
             poll = setInterval(() => {
                 if (dc.bufferedAmount <= limit) finish();
             }, 50);
-            setTimeout(finish, 15000);
+            hard = setTimeout(finish, 15000);
         });
     }
 
@@ -141,8 +154,19 @@
             blockPos += buf.byteLength;
             offset += buf.byteLength;
 
-            await waitDrain(dc);
-            if (dc.readyState !== 'open') throw new Error('连接中断');
+            /* 发送节奏：没满就连续发，把 1MB~4MB 的在途窗口始终填着；
+             * 只有真的到高水位了才等一次，等到低水位再接着填。
+             *
+             * 曾经是"每发一块都先 await waitDrain"，而 bufferedamountlow 的阈值
+             * 默认是 0、要等整队泄空才触发，实际放行全靠 50ms 轮询——于是每块
+             * 都要赔一个最多 50ms 的轮询周期，吞吐被钉在 块大小/50ms ≈ 5MB/s，
+             * 链路再快也上不去（用户实测两个版本都卡在 5M/b）。
+             * 改成突发填充后，等待只发生在窗口真的打满时，且由事件驱动、
+             * 不受轮询粒度影响；两次等待之间是同步发送，泄流计时器插不进来。 */
+            if (dc.bufferedAmount >= DRAIN_LIMIT) {
+                await waitDrain(dc, LOW_WATER);
+                if (dc.readyState !== 'open') throw new Error('连接中断');
+            }
 
             try {
                 dc.send(buf);

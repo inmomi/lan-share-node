@@ -444,6 +444,7 @@ class FakeDataChannel extends EventTarget {
         this.rate = rate;
         this.peak = 0;
         this.received = [];
+        this.sendLog = [];
         this.throws = 0;
         this._timer = setInterval(() => this._drain(), 10);
     }
@@ -461,6 +462,8 @@ class FakeDataChannel extends EventTarget {
         if (this.readyState !== 'open') {
             throw new Error('InvalidStateError: RTCDataChannel is closed');
         }
+        /* 记录发送前的缓冲量，用来判断"两次 send 之间有没有泄流" */
+        this.sendLog.push(this.bufferedAmount);
         if (this.bufferedAmount + buf.byteLength > this.cap) {
             this.throws++;
             throw new Error(
@@ -558,6 +561,48 @@ async function testPump() {
     }
     check('续传只发剩余部分', sent3 === file.size && dc3.receivedBytes === 32 * MB,
         `sent=${sent3} received=${dc3.receivedBytes}`);
+
+    /* 8. 发送节奏：窗口没打满时必须连续发，不能每块都等一次。
+     *
+     *    曾经的写法是"每发一块都先 await waitDrain"，而 bufferedamountlow
+     *    的阈值默认是 0、要等整队泄空才触发，实际放行全靠 50ms 轮询。
+     *    链路上每块的放行都要赔一个轮询周期，吞吐被钉在 块大小/50ms
+     *    ≈ 5MB/s（用户实测两个版本都卡在 5M/b，P2P 只有 2.7MB/s）。
+     *
+     *    这条用例不测时间（测时间在 CI 上会flaky），测的是确定性结构：
+     *    两次等待之间是同步发送，泄流计时器插不进来，所以必然出现一段
+     *    "连续多发且中间零泄流"的突发。旧写法每发一块前都真等一次，
+     *    突发长度只有 1~3 块；新写法从低水位填到高水位，突发 ≥ 8 块。
+     *    故意用慢速假通道（16KB/ms），让旧写法的轮询粒度充分暴露。 */
+    const file8 = fakeFile(8 * MB);
+    const dc8 = new FakeDataChannel(pump.CHROME_DC_QUEUE_CAP, 16 * 1024);
+    try {
+        await pump.pumpFile(dc8, file8, 0, { chunk: 262144 });
+    } finally {
+        dc8.stop();
+    }
+
+    const log = dc8.sendLog;
+    const chunk = 262144;
+    /* 找第一次"发送前发生了泄流"的位置——那之前的初始填充两种写法都有，
+     * 不具区分度，只看它之后的突发长度。 */
+    let firstDrain = -1;
+    for (let i = 1; i < log.length; i++) {
+        if (log[i] < log[i - 1] + chunk) { firstDrain = i; break; }
+    }
+    let maxBurst = 0;
+    let burst = firstDrain >= 0 ? 1 : 0;
+    for (let i = Math.max(1, firstDrain); i < log.length; i++) {
+        burst = (log[i] === log[i - 1] + chunk) ? burst + 1 : 1;
+        if (burst > maxBurst) maxBurst = burst;
+    }
+    const wantBurst = Math.floor((pump.DRAIN_LIMIT - pump.LOW_WATER) / chunk);
+    check('窗口未打满时连续发送（不等轮询）', maxBurst >= 8,
+        `最长突发 ${maxBurst} 块（期望 ≥ 8，理论上限 ${wantBurst + 1}）`);
+    check('确实打满过高水位（不是一直在低水位发）',
+        dc8.peak >= pump.DRAIN_LIMIT, `peak=${(dc8.peak / MB).toFixed(2)}MB`);
+    check('突发发送同样不越 16MB 上限', dc8.peak <= pump.CHROME_DC_QUEUE_CAP,
+        `peak=${(dc8.peak / MB).toFixed(2)}MB`);
 }
 
 /* ---------------------------------------------------- 测速状态隔离

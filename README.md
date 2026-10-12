@@ -46,7 +46,7 @@ Windows 双击 `start.bat` 即可。
 
 - **零第三方依赖**。WebSocket 服务端是按 RFC 6455 自己实现的握手与帧编解码，不装 `ws`；上传用裸请求体流式落盘，不装 `multer`/`busboy`。`npm install` 什么都不用装。
 - **不配 STUN/TURN**。纯内网场景下 WebRTC 用本机内网 IP 的 host candidate 就能直连，因此完全离线可用。
-- **分块 + 背压 + 预读**。切片取 `RTCSctpTransport.maxMessageSize` 与 1 MB 的较小值（Chrome 默认 256 KB，比旧的 64 KB 快一个量级）；背压高水位 4 MB、低水位 1 MB。**高水位不要往 16 MB 调**——Chrome 的 DataChannel 发送队列总共只有约 16 MB，`bufferedAmount` 一超过，`send()` 不是排队而是直接抛 `RTCDataChannel send queue is full`，整次传输当场判死（本机实测 16.3 MB 处必现）。发送前一次读 8 MB 再切块，避免每块都串行等一次磁盘读取。
+- **分块 + 背压 + 预读**。切片取 `RTCSctpTransport.maxMessageSize` 与 1 MB 的较小值（Chrome 默认 256 KB，比旧的 64 KB 快一个量级）；背压高水位 4 MB、低水位 1 MB，**窗口没打满就连续发、打满了才等一次低水位**。两个坑都踩过：高水位不要往 16 MB 调——Chrome 的 DataChannel 发送队列总共只有约 16 MB，`bufferedAmount` 一超过，`send()` 不是排队而是直接抛 `RTCDataChannel send queue is full`，整次传输当场判死（本机实测 16.3 MB 处必现）；也不要每发一块都等一次——`bufferedamountlow` 的阈值默认是 0、要等整队泄空才触发，实际放行全靠 50 ms 轮询，每块赔一个轮询周期，吞吐被钉在 5 MB/s 左右（实测两个版本都卡在 5M/b）。发送前一次读 8 MB 再切块，避免每块都串行等一次磁盘读取。
 - **断点续传**。直传按 `name|size|lastModified` 生成 `fileId`，中断时记下已收偏移，重发时接收端回 `offset` 从断点继续；文件库上传按 4 MB 分块带 `offset` 续写 `.part`，先查 `/api/upload-status` 定位起点；下载由 HTTP Range 提供。
 - **设备名持久化**。浏览器端存 `localStorage`，服务端按 IP 记住上次的名字，刷新和重连都保持。
 - **pacing 单独一个文件**。`public/p2p-pump.js` 用 UMD 包了一层，Node 里可以直接 `require`；测试用假 DataChannel 复现 Chrome 的 16 MB 队列上限来跑真代码——背压阈值这类边界靠真机点文件是点不出来的。
