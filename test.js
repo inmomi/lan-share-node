@@ -302,8 +302,14 @@ async function testWebSocket() {
 
     if (process.env.SPAWN) {
         const cmd = process.env.SPAWN;
-        const shell = process.platform === 'win32';
-        child = spawn(cmd, { shell, stdio: ['ignore', 'pipe', 'pipe'] });
+        /* 注意第二个参数是 argv 数组、第三个才是 options。
+         * 写成 spawn(cmd, { shell: true }) 会把 options 当成 argv，
+         * Node 就会把整串 "node server.js" 当作可执行文件路径去找，直接 ENOENT。
+         * 统一走 shell 是为了让 SPAWN 支持 "./lan-share -p 8080 -d ./uploads" 这种带参数的写法。 */
+        child = spawn(cmd, [], {
+            shell: true,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
         child.stdout.on('data', (d) => process.stdout.write(`[srv] ${d}`));
         child.stderr.on('data', (d) => process.stderr.write(`[srv!] ${d}`));
         const ready = await waitReady(base.hostname, Number(base.port || 80), 20000);
