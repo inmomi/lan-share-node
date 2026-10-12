@@ -1,0 +1,55 @@
+name: Release
+
+# Node 版没有编译步骤，"二进制"就是这份源码——打 tag 时先把完整测试跑一遍
+# 作为发布门槛，再把源码打包成 zip 附到 Release 上（GitHub 自带的
+# Source code 归档也可以，这里是带 SHA256 的显式产物）。
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  test:
+    name: 发布前测试门槛
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 语法检查
+        run: node --check server.js
+      - name: 运行端到端测试
+        env:
+          SPAWN: node server.js
+          BASE: http://127.0.0.1:8080
+          TRAVERSAL_PROBE: server.js
+        run: node test.js
+
+  package:
+    name: 打包并发布
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 打源码包（排除 .git 与本地上传目录）
+        run: |
+          set -e
+          mkdir -p dist/lan-share
+          git archive --format=tar HEAD | tar -x -C dist/lan-share
+          cd dist
+          zip -qr - lan-share > lan-share-node-src.zip
+          sha256sum lan-share-node-src.zip | tee lan-share-node-src.zip.sha256
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/lan-share-node-src.zip
+            dist/lan-share-node-src.zip.sha256
+          generate_release_notes: true
