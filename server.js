@@ -1,0 +1,462 @@
+'use strict';
+
+/**
+ * LAN Share - zero dependency LAN file sharing server.
+ *
+ * Two transfer paths:
+ *   1. Peer-to-peer: WebRTC DataChannel between browsers. This server only
+ *      relays signalling (offer / answer / ICE) and never sees file bytes.
+ *   2. Server vault: plain HTTP upload / download. Files land on disk here.
+ */
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+
+const PORT = Number(process.env.PORT || 8080);
+const HOST = process.env.HOST || '0.0.0.0';
+const ROOT_DIR = __dirname;
+const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
+const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(ROOT_DIR, 'uploads'));
+
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.png': 'image/png',
+  '.woff2': 'font/woff2',
+};
+
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const OP_CONT = 0x0;
+const OP_TEXT = 0x1;
+const OP_BINARY = 0x2;
+const OP_CLOSE = 0x8;
+const OP_PING = 0x9;
+const OP_PONG = 0xa;
+
+// ---------------------------------------------------------------- utilities
+
+function safeJoin(baseDir, target) {
+  const resolved = path.resolve(baseDir, target);
+  if (resolved !== baseDir && !resolved.startsWith(baseDir + path.sep)) return null;
+  return resolved;
+}
+
+/** Strip any directory component so a crafted name cannot escape UPLOAD_DIR. */
+function safeName(raw) {
+  const base = path.basename(String(raw || '').replace(/\\/g, '/'));
+  const cleaned = base.split('').filter(function (ch) { var c = ch.charCodeAt(0); return c > 31 && c !== 127; }).join('').trim();
+  return cleaned.length ? cleaned : 'unnamed';
+}
+
+function uniqueTarget(name) {
+  let candidate = path.join(UPLOAD_DIR, name);
+  if (!fs.existsSync(candidate)) return candidate;
+  const ext = path.extname(name);
+  const stem = path.basename(name, ext);
+  for (let i = 1; i < 999; i += 1) {
+    candidate = path.join(UPLOAD_DIR, `${stem} (${i})${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(UPLOAD_DIR, `${Date.now()}-${name}`);
+}
+
+function humanSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = n / 1024;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  return `${value.toFixed(value >= 100 || idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
+
+function lanAddresses() {
+  const out = [];
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const item of list || []) {
+      if (item.family === 'IPv4' && !item.internal) out.push(item.address);
+    }
+  }
+  return out;
+}
+
+function sendJson(res, status, payload) {
+  const body = Buffer.from(JSON.stringify(payload), 'utf8');
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': body.length,
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+}
+
+// ------------------------------------------------------- WebSocket plumbing
+
+function parseFrame(buf) {
+  if (buf.length < 2) return null;
+  const b0 = buf[0];
+  const b1 = buf[1];
+  const fin = (b0 & 0x80) !== 0;
+  const opcode = b0 & 0x0f;
+  const masked = (b1 & 0x80) !== 0;
+  let length = b1 & 0x7f;
+  let offset = 2;
+
+  if (length === 126) {
+    if (buf.length < 4) return null;
+    length = buf.readUInt16BE(2);
+    offset = 4;
+  } else if (length === 127) {
+    if (buf.length < 10) return null;
+    const big = buf.readBigUInt64BE(2);
+    if (big > BigInt(64 * 1024 * 1024)) return null;
+    length = Number(big);
+    offset = 10;
+  }
+
+  let mask = null;
+  if (masked) {
+    if (buf.length < offset + 4) return null;
+    mask = buf.subarray(offset, offset + 4);
+    offset += 4;
+  }
+
+  if (buf.length < offset + length) return null;
+  const payload = Buffer.from(buf.subarray(offset, offset + length));
+  if (mask) {
+    for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4];
+  }
+  return { fin, opcode, payload, consumed: offset + length };
+}
+
+function writeFrame(socket, opcode, data) {
+  const payload = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8');
+  const length = payload.length;
+  let header;
+  if (length < 126) {
+    header = Buffer.alloc(2);
+    header[1] = length;
+  } else if (length < 65536) {
+    header = Buffer.alloc(4);
+    header[1] = 126;
+    header.writeUInt16BE(length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(length), 2);
+  }
+  header[0] = 0x80 | opcode;
+  socket.write(Buffer.concat([header, payload]));
+}
+
+// ------------------------------------------------------------ client registry
+
+const clients = new Map(); // id -> { id, name, ip, socket }
+let clientSeq = 0;
+
+const ADJECTIVES = ['蓝色', '银色', '安静', '敏捷', '温暖', '明亮', '沉稳', '轻盈', '清澈', '柔和'];
+const ANIMALS = ['海豚', '猎鹰', '水獭', '狐狸', '鲸鱼', '山猫', '燕子', '小鹿', '海豹', '苍鹭'];
+
+function randomName() {
+  const a = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
+  const b = ANIMALS[Math.floor(Math.random() * ANIMALS.length)];
+  return `${a}${b}`;
+}
+
+function peerList() {
+  return [...clients.values()].map((c) => ({ id: c.id, name: c.name, ip: c.ip }));
+}
+
+function sendTo(client, obj) {
+  try {
+    writeFrame(client.socket, OP_TEXT, JSON.stringify(obj));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function broadcastPeers() {
+  const peers = peerList();
+  for (const client of clients.values()) sendTo(client, { type: 'peers', peers });
+}
+
+function attachClient(socket, ip) {
+  clientSeq += 1;
+  const client = {
+    id: `dev-${clientSeq}-${crypto.randomBytes(3).toString('hex')}`,
+    name: randomName(),
+    ip,
+    socket,
+  };
+  clients.set(client.id, client);
+
+  let buffer = Buffer.alloc(0);
+  let fragOpcode = 0;
+  let fragParts = [];
+
+  const handleMessage = (text) => {
+    let msg;
+    try {
+      msg = JSON.parse(text);
+    } catch (_) {
+      return;
+    }
+    if (msg.type === 'rename' && typeof msg.name === 'string') {
+      const trimmed = msg.name.trim().slice(0, 24);
+      if (trimmed) client.name = trimmed;
+      sendTo(client, { type: 'self', id: client.id, name: client.name });
+      broadcastPeers();
+      return;
+    }
+    if (msg.type === 'signal' && msg.to) {
+      const target = clients.get(msg.to);
+      if (target) {
+        sendTo(target, { type: 'signal', from: client.id, data: msg.data });
+      } else {
+        sendTo(client, { type: 'signal-lost', to: msg.to });
+      }
+    }
+  };
+
+  socket.on('data', (chunk) => {
+    buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
+    for (;;) {
+      const frame = parseFrame(buffer);
+      if (!frame) break;
+      buffer = buffer.subarray(frame.consumed);
+
+      if (frame.opcode === OP_CLOSE) {
+        socket.end();
+        return;
+      }
+      if (frame.opcode === OP_PING) {
+        writeFrame(socket, OP_PONG, frame.payload);
+        continue;
+      }
+      if (frame.opcode === OP_PONG) continue;
+
+      if (frame.opcode === OP_CONT) {
+        fragParts.push(frame.payload);
+        if (frame.fin) {
+          const full = Buffer.concat(fragParts);
+          fragParts = [];
+          if (fragOpcode === OP_TEXT) handleMessage(full.toString('utf8'));
+          fragOpcode = 0;
+        }
+        continue;
+      }
+
+      if (!frame.fin) {
+        fragOpcode = frame.opcode;
+        fragParts = [frame.payload];
+        continue;
+      }
+      if (frame.opcode === OP_TEXT) handleMessage(frame.payload.toString('utf8'));
+    }
+  });
+
+  const cleanup = () => {
+    if (!clients.has(client.id)) return;
+    clients.delete(client.id);
+    broadcastPeers();
+  };
+  socket.on('close', cleanup);
+  socket.on('error', cleanup);
+
+  sendTo(client, { type: 'self', id: client.id, name: client.name });
+  broadcastPeers();
+}
+
+function handleUpgrade(req, socket) {
+  const key = req.headers['sec-websocket-key'];
+  if (!key) {
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+    return;
+  }
+  const accept = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+  socket.write(
+    'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n' +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+  );
+  socket.setNoDelay(true);
+  const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  attachClient(socket, ip);
+}
+
+// --------------------------------------------------------------- HTTP server
+
+function serveStatic(req, res, pathname) {
+  const rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+  const filePath = safeJoin(PUBLIC_DIR, rel);
+  if (!filePath || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('404 Not Found');
+    return;
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  const stat = fs.statSync(filePath);
+  res.writeHead(200, {
+    'Content-Type': MIME[ext] || 'application/octet-stream',
+    'Content-Length': stat.size,
+    'Cache-Control': 'no-cache',
+  });
+  fs.createReadStream(filePath).pipe(res);
+}
+
+function listFiles(req, res) {
+  fs.readdir(UPLOAD_DIR, { withFileTypes: true }, (err, entries) => {
+    if (err) {
+      sendJson(res, 500, { error: '无法读取存储目录' });
+      return;
+    }
+    const files = [];
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const full = path.join(UPLOAD_DIR, entry.name);
+      try {
+        const stat = fs.statSync(full);
+        files.push({
+          name: entry.name,
+          size: stat.size,
+          sizeText: humanSize(stat.size),
+          mtime: stat.mtimeMs,
+        });
+      } catch (_) {
+        /* skip unreadable entries */
+      }
+    }
+    files.sort((a, b) => b.mtime - a.mtime);
+    sendJson(res, 200, { files, total: files.reduce((sum, f) => sum + f.size, 0) });
+  });
+}
+
+function uploadFile(req, res, url) {
+  const requested = url.searchParams.get('name') || 'unnamed';
+  const name = safeName(requested);
+  let target;
+  try {
+    target = uniqueTarget(name);
+  } catch (err) {
+    sendJson(res, 500, { error: `创建文件失败: ${err.message}` });
+    return;
+  }
+
+  const stream = fs.createWriteStream(target);
+  let bytes = 0;
+  req.on('data', (chunk) => {
+    bytes += chunk.length;
+  });
+  stream.on('error', (err) => {
+    sendJson(res, 500, { error: `写入失败: ${err.message}` });
+  });
+  stream.on('finish', () => {
+    sendJson(res, 200, {
+      ok: true,
+      name: path.basename(target),
+      size: bytes,
+      sizeText: humanSize(bytes),
+    });
+  });
+  req.on('aborted', () => {
+    stream.destroy();
+    fs.unlink(target, () => {});
+  });
+  req.pipe(stream);
+}
+
+function downloadFile(req, res, url) {
+  const name = safeName(url.searchParams.get('name') || '');
+  const filePath = safeJoin(UPLOAD_DIR, name);
+  if (!filePath || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('404 Not Found');
+    return;
+  }
+  const stat = fs.statSync(filePath);
+  const encoded = encodeURIComponent(name);
+  res.writeHead(200, {
+    'Content-Type': 'application/octet-stream',
+    'Content-Length': stat.size,
+    'Content-Disposition': `attachment; filename*=UTF-8''${encoded}`,
+  });
+  fs.createReadStream(filePath).pipe(res);
+}
+
+function deleteFile(req, res, url) {
+  const name = safeName(url.searchParams.get('name') || '');
+  const filePath = safeJoin(UPLOAD_DIR, name);
+  if (!filePath || !fs.existsSync(filePath)) {
+    sendJson(res, 404, { error: '文件不存在' });
+    return;
+  }
+  fs.unlink(filePath, (err) => {
+    if (err) {
+      sendJson(res, 500, { error: `删除失败: ${err.message}` });
+      return;
+    }
+    sendJson(res, 200, { ok: true, name });
+  });
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const { pathname } = url;
+
+  if (pathname === '/api/files' && req.method === 'GET') return listFiles(req, res);
+  if (pathname === '/api/upload' && req.method === 'POST') return uploadFile(req, res, url);
+  if (pathname === '/api/download' && req.method === 'GET') return downloadFile(req, res, url);
+  if (pathname === '/api/files' && req.method === 'DELETE') return deleteFile(req, res, url);
+  if (pathname === '/api/info' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      peers: clients.size,
+      uploadDir: UPLOAD_DIR,
+      uploadCount: fs.readdirSync(UPLOAD_DIR).length,
+    });
+  }
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    sendJson(res, 405, { error: 'Method Not Allowed' });
+    return;
+  }
+  return serveStatic(req, res, pathname);
+});
+
+server.on('upgrade', (req, socket, head) => {
+  if (head && head.length) socket.unshift(head);
+  handleUpgrade(req, socket);
+});
+
+server.listen(PORT, HOST, () => {
+  const self = lanAddresses();
+  console.log('');
+  console.log('  LAN Share 已启动');
+  console.log('  ------------------------------------------');
+  console.log(`  本机访问:      http://localhost:${PORT}`);
+  for (const ip of self) {
+    console.log(`  局域网访问:    http://${ip}:${PORT}`);
+  }
+  console.log(`  文件存储目录:  ${UPLOAD_DIR}`);
+  console.log('  ------------------------------------------');
+  console.log('  设备间传文件走 WebRTC 直连，服务端不中转文件内容。');
+  console.log('  存到服务端的文件会落盘在上面的目录中，可随时下载。');
+  console.log('');
+});
+
+process.on('SIGINT', () => {
+  console.log('\n正在关闭...');
+  server.close(() => process.exit(0));
+});
