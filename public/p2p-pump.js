@@ -34,6 +34,9 @@
     /* 一次从磁盘读多少字节，再在内存里切成 MAX_CHUNK。
      * 必须远大于 MAX_CHUNK，否则省不掉 IPC 次数；也不必太大。 */
     const READ_BLOCK = 8 * 1024 * 1024;
+    /* 接收端测速状态的硬超时。远大于正常测速耗时（16MB 即使只有 1MB/s 也就
+     * 16 秒），但又不能无限——见 speedtestCount 里的说明。 */
+    const SPEED_TEST_TIMEOUT = 60000;
 
     /* 静态自检：高水位加上一块必须明显小于 Chrome 的队列上限，
      * 否则 send() 会在传输中途抛"队列满"。这条断言挡的是"把阈值往上调"这类改动。 */
@@ -157,9 +160,53 @@
         return offset;
     }
 
+    /* ------------------------------------------------------------ 测速计数
+     * 计数状态挂在连接上（conn.speedtest），不是全局。
+     * 挂在全局会出这种事：A 和 B 在测速，同时 C 发文件给 A，A 把 C 的文件分块
+     * 也当成测速流量计数——数字虚高，而且 C 的文件永远收不完。
+     * 每个函数都做成纯函数形式（conn 只是载体），方便在 Node 里单测。 */
+
+    /** 对端发起测速：开始计数。now 传进来是为了测试能控制时间。 */
+    function speedtestBegin(conn, bytes, now) {
+        conn.speedtest = {
+            bytes: Number(bytes) || 0,
+            received: 0,
+            t0: now,
+            deadline: now + SPEED_TEST_TIMEOUT,
+        };
+    }
+
+    /** 收到一块测速数据。返回 true 表示这一块被测速吃掉了。 */
+    function speedtestCount(conn, byteLength, now) {
+        const st = conn.speedtest;
+        if (!st) return false;
+        if (now > st.deadline) {
+            /* 超时：这次测速大概永远不会正常结束（发送方抛异常、掉线、
+             * 标签页被关都会导致 speedtest-end 不来）。必须作废，
+             * 否则后面真实文件的分块会被继续吞掉，传输看起来就是无限卡死。 */
+            conn.speedtest = null;
+            return false;
+        }
+        st.received += byteLength;
+        return true;
+    }
+
+    /** 对端发来收尾：返回统计并作废状态。没有进行中的测速则返回 null。 */
+    function speedtestFinish(conn, now) {
+        const st = conn.speedtest;
+        conn.speedtest = null;
+        return st ? { received: st.received, ms: now - st.t0 } : null;
+    }
+
+    /** 发送方没能正常收尾，明确作废。 */
+    function speedtestAbort(conn) {
+        conn.speedtest = null;
+    }
+
     return {
         CHROME_DC_QUEUE_CAP,
-        MAX_CHUNK, DRAIN_LIMIT, LOW_WATER, READ_BLOCK,
+        MAX_CHUNK, DRAIN_LIMIT, LOW_WATER, READ_BLOCK, SPEED_TEST_TIMEOUT,
         planBlocks, readBlockAt, chunkSizeFor, isRetryableSendError, waitDrain, pumpFile,
+        speedtestBegin, speedtestCount, speedtestFinish, speedtestAbort,
     };
 });

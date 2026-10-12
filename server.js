@@ -593,7 +593,24 @@ server.listen(PORT, HOST, () => {
   console.log('');
 });
 
+/* Ctrl-C 退出。
+ * 原来只写 server.close(() => process.exit(0))，看起来没问题，实际上
+ * server.close() 要等**所有**连接结束才回调——浏览器开着的 WebSocket 和
+ * HTTP keep-alive 连接不会自己断，回调永远不触发，Ctrl-C 按下去就像卡住。
+ * 所以：先主动断掉信令连接，再给一个宽限期，超时就地退出。
+ * 正在上传的文件会被截断，但分块上传有 .part 半成品，重传能从断点续上。 */
 process.on('SIGINT', () => {
   console.log('\n正在关闭...');
-  server.close(() => process.exit(0));
+  const force = setTimeout(() => process.exit(0), 2000);
+  force.unref();
+  server.close(() => {
+    clearTimeout(force);
+    process.exit(0);
+  });
+  for (const c of clients.values()) {
+    try { c.socket.close(); } catch (_) { /* 已经断了 */ }
+  }
 });
+
+/* SIGTERM（systemd / kill）没有宽限期，直接退 */
+process.on('SIGTERM', () => process.exit(0));

@@ -11,7 +11,8 @@
  * 直接 require 做单测。注意那里的 DRAIN_LIMIT 必须远小于 Chrome DataChannel
  * 发送队列约 16MB 的硬上限，超了 send() 会直接抛
  * "RTCDataChannel send queue is full"，把整次传输判死。 */
-const { LOW_WATER, chunkSizeFor, pumpFile } = LSPump;
+const { LOW_WATER, chunkSizeFor, pumpFile,
+  speedtestBegin, speedtestCount, speedtestFinish, speedtestAbort } = LSPump;
 
 /* 文件库上传的分块大小。走 HTTP，没有 256KB 的限制，取大一点减少往返。 */
 const UP_CHUNK = 4 * 1024 * 1024;
@@ -28,8 +29,9 @@ const state = {
   conns: new Map(),
   queue: Promise.resolve(),
   incoming: null,
-  /* 非空表示正在接收对端的测速流量，此时二进制消息只计数不当文件 */
-  speedtest: null,
+  /* 非空表示本连接正在接收对端的测速流量，此时二进制消息只计数不当文件。
+   * 计数状态按连接存（conn.speedtest），不是全局——挂在全局会让一个连接的
+   * 测速流量把另一个连接的文件分块吞掉。 */
   pendingAccept: new Map(),
   transfers: new Map(),
   targetPeer: null,
@@ -210,7 +212,7 @@ function getConn(peerId) {
 
   pc.addEventListener('connectionstatechange', () => {
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-      markInterrupted();
+      markInterrupted(conn);
       state.conns.delete(peerId);
       renderPeers();
     } else {
@@ -231,7 +233,7 @@ function attachChannel(conn, dc) {
   });
   dc.addEventListener('message', (event) => onChannelMessage(conn, event.data));
   dc.addEventListener('close', () => {
-    markInterrupted();
+    markInterrupted(conn);
     state.conns.delete(conn.peerId);
     renderPeers();
   });
@@ -360,6 +362,12 @@ function onChannelMessage(conn, data) {
     } catch (_) {
       return;
     }
+    /* 一旦进入正式的文件协议，就认为测速状态作废。
+     * 双保险：除了 deadline 超时，也要保证测速残留不会把文件分块吞掉。 */
+    if (msg.t === 'file-offer' || msg.t === 'file-accept'
+      || msg.t === 'file-reject' || msg.t === 'file-end') {
+      state.speedtest = null;
+    }
     if (msg.t === 'file-offer') {
       askReceive(conn, msg);
     } else if (msg.t === 'file-accept' || msg.t === 'file-reject') {
@@ -374,30 +382,30 @@ function onChannelMessage(conn, data) {
     } else if (msg.t === 'text') {
       toast(`来自 ${peerName(conn.peerId)}：${msg.text}`);
     } else if (msg.t === 'speedtest') {
-      /* 对端在测链路速度：接下来收到的二进制只计数，不弹窗、不进文件库。
-       * state.speedtest 存在期间，onChannelMessage 的二进制分支会走计数分支。 */
-      state.speedtest = { bytes: Number(msg.bytes) || 0, received: 0, t0: Date.now() };
+      /* 对端在测链路速度：接下来这条连接上的二进制只计数，不弹窗、不进文件库。
+       * 计数挂在 conn 上并有硬超时，万一 speedtest-end 永远不来也不会
+       * 把后续真实文件的分块吞掉（那种症状就是传输无限卡死）。 */
+      speedtestBegin(conn, msg.bytes, Date.now());
       conn.dc.send(JSON.stringify({ t: 'speedtest-ready' }));
     } else if (msg.t === 'speedtest-end') {
-      const st = state.speedtest;
-      state.speedtest = null;
+      const st = speedtestFinish(conn, Date.now());
       if (st) {
         conn.dc.send(JSON.stringify({
           t: 'speedtest-result',
           received: st.received,
-          ms: Date.now() - st.t0,
+          ms: st.ms,
         }));
       }
+    } else if (msg.t === 'speedtest-abort') {
+      /* 发送方没能正常收尾，明确告诉接收端作废计数状态 */
+      speedtestAbort(conn);
     }
     return;
   }
 
   /* 测速进行中：只累加字节数。放在 state.incoming 判断之前，
    * 保证测速数据永远不会被误当成文件内容。 */
-  if (state.speedtest) {
-    state.speedtest.received += data.byteLength;
-    return;
-  }
+  if (speedtestCount(conn, data.byteLength, Date.now())) return;
 
   if (state.incoming) {
     state.incoming.chunks.push(data);
@@ -448,9 +456,9 @@ async function askReceive(conn, msg) {
 }
 
 /** 通道中途断开：保留已收到的分块，等对方重发同一个文件后续上。 */
-function markInterrupted() {
-  /* 测速中断了就把计数状态丢掉，否则后面来的二进制还会被当成测速流量吞掉 */
-  state.speedtest = null;
+function markInterrupted(conn) {
+  /* 通道断了，这条连接上的测速计数状态也必须作废 */
+  if (conn) speedtestAbort(conn);
   const inc = state.incoming;
   if (!inc) return;
   state.incoming = null;
@@ -905,11 +913,24 @@ async function speedP2p(peerId) {
 
   const blob = new Blob([new Uint8Array(SPEED_BYTES)]);
   const t0 = performance.now();
-  await pumpFile(dc, blob, 0, { chunk: chunkSizeFor(conn) });
-  dc.send(JSON.stringify({ t: 'speedtest-end' }));
+  try {
+    await pumpFile(dc, blob, 0, { chunk: chunkSizeFor(conn) });
+    dc.send(JSON.stringify({ t: 'speedtest-end' }));
+  } catch (err) {
+    /* 没能正常收尾一定要告诉对端，否则它会一直停在计数状态，
+     * 把后续真实文件的分块全吞掉。 */
+    try { dc.send(JSON.stringify({ t: 'speedtest-abort' })); } catch (_) { /* 通道已断 */ }
+    throw err;
+  }
   const r = await echoed;
   const secs = (performance.now() - t0) / 1000;
-  return { mbps: SPEED_BYTES / 1048576 / secs, echoed: r };
+  /* 注意两个数字的含义不同：
+   *   mbps       —— 本机把字节交给 DataChannel 的速率，含背压等待，
+   *                 也就是"我这边发得多快"。
+   *   peerMbps   —— 对端真正收完的速率，由对端计时，这才是端到端速度。
+   * 背压存在时本机数字会被等待拉低，所以以对端数字为准。 */
+  const peerMbps = (r && r.ms > 0) ? (r.received / 1048576) / (r.ms / 1000) : 0;
+  return { mbps: SPEED_BYTES / 1048576 / secs, peerMbps, echoed: r };
 }
 
 async function runSpeedTest() {
@@ -934,9 +955,12 @@ async function runSpeedTest() {
 
     if (peer) {
       const p2p = await speedP2p(peer.id);
+      /* 对端确认的速率才是端到端真实速度；本机速率只是"交付出手"的速度，
+       * 背压等待会把它压低。两个都显示，方便判断是谁在等。 */
       const extra = p2p.echoed
-        ? ` · 对端确认 ${(p2p.echoed.received / 1048576).toFixed(1)}MB`
-        : '';
+        ? ` · 对端收到 ${(p2p.echoed.received / 1048576).toFixed(1)}MB`
+          + ` @ ${p2p.peerMbps.toFixed(1)} MB/s`
+        : ' · 对端未回执';
       speedSet('spP2p', `${p2p.mbps.toFixed(1)} MB/s${extra}`);
     } else {
       speedSet('spP2p', '跳过（没有在线设备）');

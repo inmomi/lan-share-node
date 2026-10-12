@@ -560,6 +560,70 @@ async function testPump() {
         `sent=${sent3} received=${dc3.receivedBytes}`);
 }
 
+/* ---------------------------------------------------- 测速状态隔离
+ *
+ * 曾经的 bug：speedtest 状态挂在全局 state 上。一旦对端没回
+ * speedtest-end（网络抖动、对端刷新页面），全局标志就一直开着，
+ * 之后所有二进制消息都被当成测速数据吞掉，文件传输永久卡住，
+ * 而且 A/B 各自测速会互相把对方的文件分片吞掉。
+ * 这里逐条锁死：状态必须跟着连接走、必须有超时、必须能中止。
+ */
+async function testSpeedtestState() {
+  const mkConn = () => ({ dc: { readyState: 'open' } });
+
+  /* 1. 正常流程 */
+  const now = 1000000;
+  const a = mkConn();
+  pump.speedtestBegin(a, 16 * 1024 * 1024, now);
+  check('测速开始后有状态', !!a.speedtest);
+  check('测速计数累计', pump.speedtestCount(a, 4096, now + 1) === true);
+  check('测速计数累计2', pump.speedtestCount(a, 4096, now + 2) === true);
+  const r = pump.speedtestFinish(a, now + 1000);
+  check('测速结束返回统计',
+      !!r && r.received === 8192 && r.ms === 1000,
+      `received=${r && r.received} ms=${r && r.ms}`);
+  check('结束后状态清空', a.speedtest === null);
+  check('结束后再计数不吞数据', pump.speedtestCount(a, 4096, now + 1001) === false);
+
+  /* 2. 没开测速的连接不能吞数据 */
+  const b = mkConn();
+  check('空闲连接不吞数据', pump.speedtestCount(b, 65536, now) === false);
+  check('空闲连接 finish 返回 null', pump.speedtestFinish(b, now) === null);
+
+  /* 3. 关键回归：A 在测速，B 的文件分片必须照样透传 */
+  const c = mkConn();
+  pump.speedtestBegin(c, 16 * 1024 * 1024, now);
+  check('别的连接不受影响', pump.speedtestCount(b, 1024, now) === false);
+  check('自己的连接还在测', pump.speedtestCount(c, 1024, now) === true);
+  pump.speedtestFinish(c, now + 1);
+  check('A 结束后 A 也不吞了', pump.speedtestCount(c, 1024, now + 2) === false);
+
+  /* 4. 超时自动解除，不会永久卡死 */
+  const d = mkConn();
+  pump.speedtestBegin(d, 16 * 1024 * 1024, now);
+  check('超时后不再吞数据',
+      pump.speedtestCount(d, 4096, now + pump.SPEED_TEST_TIMEOUT + 1) === false);
+  check('超时后状态被清空', d.speedtest === null);
+
+  /* 5. 主动中止 */
+  const e = mkConn();
+  pump.speedtestBegin(e, 16 * 1024 * 1024, now);
+  pump.speedtestAbort(e);
+  check('中止后状态清空', e.speedtest === null);
+  check('中止后不吞数据', pump.speedtestCount(e, 4096, now + 1) === false);
+
+  /* 6. 非数字 bytes 不能把 NaN 带进统计 */
+  const f = mkConn();
+  pump.speedtestBegin(f, 'abc', now);
+  check('非法 bytes 归一成 0', f.speedtest.bytes === 0);
+  check('非法 bytes 也统计',
+      pump.speedtestCount(f, 2048, now + 1) === true);
+
+  check('测速超时时间合理',
+      pump.SPEED_TEST_TIMEOUT >= 10000 && pump.SPEED_TEST_TIMEOUT <= 120000,
+      `${pump.SPEED_TEST_TIMEOUT}ms`);
+}
+
 /* ---------------------------------------------------------------- 测速接口
  * 页面"网速测试"标签用的三个接口：整块 POST 上传、下载、删除。
  * 单独测一遍是因为一次 POST 16MB 会让头和body挤在同一个 TCP 段里到达，
@@ -667,6 +731,7 @@ async function testNameMemory() {
         await testRange();
         await testNameMemory();
         await testPump();
+        await testSpeedtestState();
         await testSpeedEndpoints();
     } catch (err) {
         failed++;
