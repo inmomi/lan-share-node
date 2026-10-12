@@ -26,6 +26,7 @@
 <nav class="tabs">
   <button class="tab active" data-tab="p2p">设备直传</button>
   <button class="tab" data-tab="vault">服务端文件库</button>
+  <button class="tab" data-tab="speed">网速测试</button>
 </nav>
 
 <main>
@@ -44,6 +45,33 @@
     </div>
     <div id="vaultMeta" class="vault-meta"></div>
     <ul id="vaultList" class="vault-list"></ul>
+  </section>
+
+  <section id="pane-speed" class="pane">
+    <p class="hint">
+      分三段测，用来定位瓶颈在哪：<b>服务端下载</b>走 HTTP 从服务端拉，
+      <b>服务端上传</b>走 HTTP 推到服务端，<b>点对点</b>走 WebRTC 直达对方浏览器。
+      三段都慢说明是局域网链路（常见于 2.4G Wi-Fi 或百兆口）的问题，不是软件；
+      只有点对点慢才是浏览器 DataChannel 的问题。
+    </p>
+    <div class="speed-panel">
+      <div class="speed-row">
+        <span class="speed-label">服务端下载</span>
+        <span class="speed-value" id="spDown">—</span>
+      </div>
+      <div class="speed-row">
+        <span class="speed-label">服务端上传</span>
+        <span class="speed-value" id="spUp">—</span>
+      </div>
+      <div class="speed-row">
+        <span class="speed-label">点对点 <small id="spPeerName"></small></span>
+        <span class="speed-value" id="spP2p">—</span>
+      </div>
+      <div class="speed-actions">
+        <button id="runSpeed" class="btn primary">开始测速</button>
+        <span id="speedLog" class="speed-log"></span>
+      </div>
+    </div>
   </section>
 </main>
 

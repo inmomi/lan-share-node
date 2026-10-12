@@ -28,6 +28,8 @@ const state = {
   conns: new Map(),
   queue: Promise.resolve(),
   incoming: null,
+  /* 非空表示正在接收对端的测速流量，此时二进制消息只计数不当文件 */
+  speedtest: null,
   pendingAccept: new Map(),
   transfers: new Map(),
   targetPeer: null,
@@ -371,7 +373,29 @@ function onChannelMessage(conn, data) {
       finishReceive();
     } else if (msg.t === 'text') {
       toast(`来自 ${peerName(conn.peerId)}：${msg.text}`);
+    } else if (msg.t === 'speedtest') {
+      /* 对端在测链路速度：接下来收到的二进制只计数，不弹窗、不进文件库。
+       * state.speedtest 存在期间，onChannelMessage 的二进制分支会走计数分支。 */
+      state.speedtest = { bytes: Number(msg.bytes) || 0, received: 0, t0: Date.now() };
+      conn.dc.send(JSON.stringify({ t: 'speedtest-ready' }));
+    } else if (msg.t === 'speedtest-end') {
+      const st = state.speedtest;
+      state.speedtest = null;
+      if (st) {
+        conn.dc.send(JSON.stringify({
+          t: 'speedtest-result',
+          received: st.received,
+          ms: Date.now() - st.t0,
+        }));
+      }
     }
+    return;
+  }
+
+  /* 测速进行中：只累加字节数。放在 state.incoming 判断之前，
+   * 保证测速数据永远不会被误当成文件内容。 */
+  if (state.speedtest) {
+    state.speedtest.received += data.byteLength;
     return;
   }
 
@@ -425,6 +449,8 @@ async function askReceive(conn, msg) {
 
 /** 通道中途断开：保留已收到的分块，等对方重发同一个文件后续上。 */
 function markInterrupted() {
+  /* 测速中断了就把计数状态丢掉，否则后面来的二进制还会被当成测速流量吞掉 */
+  state.speedtest = null;
   const inc = state.incoming;
   if (!inc) return;
   state.incoming = null;
@@ -780,6 +806,150 @@ dropzone.addEventListener('drop', (event) => {
   dropzone.classList.remove('dragover');
   if (event.dataTransfer.files.length) uploadFiles([...event.dataTransfer.files]);
 });
+
+/* ------------------------------------------------------------------ 网速测试 */
+
+/* 测速用的数据量。16MB 足够让瞬时速率稳定下来，又不至于把路由器的
+ * 磁盘和内存折腾太久。 */
+const SPEED_BYTES = 16 * 1024 * 1024;
+const SPEED_NAME = '.speedtest-tmp';
+
+function speedSet(id, text) {
+  const el = $(id);
+  if (el) el.textContent = text;
+}
+
+function speedLog(text) {
+  const el = $('speedLog');
+  if (el) el.textContent = text;
+}
+
+/* 服务端下载：整块拉回来，测 HTTP 吞吐。 */
+function speedDownload() {
+  return new Promise((resolve, reject) => {
+    const t0 = performance.now();
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', `/api/download?name=${encodeURIComponent(SPEED_NAME)}`);
+    xhr.responseType = 'arraybuffer';
+    let bytes = 0;
+    xhr.addEventListener('progress', (e) => { bytes = e.loaded; });
+    xhr.addEventListener('load', () => {
+      const secs = (performance.now() - t0) / 1000;
+      const got = bytes || (xhr.response ? xhr.response.byteLength : 0);
+      resolve({ mbps: got / 1048576 / secs, bytes: got });
+    });
+    xhr.addEventListener('error', () => reject(new Error('下载测速失败')));
+    xhr.addEventListener('timeout', () => reject(new Error('下载测速超时')));
+    xhr.timeout = 120000;
+    xhr.send();
+  });
+}
+
+/* 服务端上传：整块推上去，测 HTTP 吞吐。 */
+function speedUpload() {
+  return new Promise((resolve, reject) => {
+    const blob = new Blob([new Uint8Array(SPEED_BYTES)]);
+    const t0 = performance.now();
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/upload?name=${encodeURIComponent(SPEED_NAME)}`
+      + `&size=${SPEED_BYTES}&offset=0`);
+    xhr.addEventListener('load', () => {
+      const secs = (performance.now() - t0) / 1000;
+      resolve({ mbps: SPEED_BYTES / 1048576 / secs });
+    });
+    xhr.addEventListener('error', () => reject(new Error('上传测速失败')));
+    xhr.addEventListener('timeout', () => reject(new Error('上传测速超时')));
+    xhr.timeout = 120000;
+    xhr.send(blob);
+  });
+}
+
+/* 点对点：往选中的设备推 SPEED_BYTES 字节，用与真实文件传输完全相同的
+ * pumpFile 通道（同样的背压和分块），所以测出来的就是实际传文件的速度。
+ * 对端只计数、不弹窗、不当文件收。 */
+async function speedP2p(peerId) {
+  const conn = await ensureChannel(peerId);
+  const dc = conn.dc;
+  dc.send(JSON.stringify({ t: 'speedtest', bytes: SPEED_BYTES }));
+
+  const ready = await new Promise((resolve) => {
+    const to = setTimeout(() => resolve(false), 10000);
+    const onMsg = (e) => {
+      if (typeof e.data !== 'string') return;
+      let m;
+      try { m = JSON.parse(e.data); } catch (_) { return; }
+      if (m.t === 'speedtest-ready') {
+        clearTimeout(to);
+        dc.removeEventListener('message', onMsg);
+        resolve(true);
+      }
+    };
+    dc.addEventListener('message', onMsg);
+  });
+  if (!ready) throw new Error('对端没有回应测速请求');
+
+  const echoed = new Promise((resolve) => {
+    const to = setTimeout(() => resolve(null), 120000);
+    const onMsg = (e) => {
+      if (typeof e.data !== 'string') return;
+      let m;
+      try { m = JSON.parse(e.data); } catch (_) { return; }
+      if (m.t === 'speedtest-result') {
+        clearTimeout(to);
+        dc.removeEventListener('message', onMsg);
+        resolve(m);
+      }
+    };
+    dc.addEventListener('message', onMsg);
+  });
+
+  const blob = new Blob([new Uint8Array(SPEED_BYTES)]);
+  const t0 = performance.now();
+  await pumpFile(dc, blob, 0, { chunk: chunkSizeFor(conn) });
+  dc.send(JSON.stringify({ t: 'speedtest-end' }));
+  const r = await echoed;
+  const secs = (performance.now() - t0) / 1000;
+  return { mbps: SPEED_BYTES / 1048576 / secs, echoed: r };
+}
+
+async function runSpeedTest() {
+  const btn = $('runSpeed');
+  if (btn) btn.disabled = true;
+  speedSet('spDown', '测试中…');
+  speedSet('spUp', '测试中…');
+  speedSet('spP2p', '测试中…');
+
+  const peer = state.peers.find((p) => p.id === state.targetPeer) || state.peers[0];
+  speedSet('spPeerName', peer ? `（${peer.name}）` : '（没有在线设备）');
+
+  try {
+    /* 先上传再下载：下载要用刚传上去的那个文件 */
+    const up = await speedUpload();
+    speedSet('spUp', `${up.mbps.toFixed(1)} MB/s`);
+    const down = await speedDownload();
+    speedSet('spDown', `${down.mbps.toFixed(1)} MB/s`);
+    /* 清理临时文件，失败就算了，不挡着出结果 */
+    fetch(`/api/files?name=${encodeURIComponent(SPEED_NAME)}`, { method: 'DELETE' })
+      .then(refreshVault).catch(() => {});
+
+    if (peer) {
+      const p2p = await speedP2p(peer.id);
+      const extra = p2p.echoed
+        ? ` · 对端确认 ${(p2p.echoed.received / 1048576).toFixed(1)}MB`
+        : '';
+      speedSet('spP2p', `${p2p.mbps.toFixed(1)} MB/s${extra}`);
+    } else {
+      speedSet('spP2p', '跳过（没有在线设备）');
+    }
+    speedLog('完成');
+  } catch (err) {
+    speedLog(`测速中断：${err.message}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+if ($('runSpeed')) $('runSpeed').addEventListener('click', () => { runSpeedTest(); });
 
 /* -------------------------------------------------------------------- tabs */
 

@@ -560,6 +560,34 @@ async function testPump() {
         `sent=${sent3} received=${dc3.receivedBytes}`);
 }
 
+/* ---------------------------------------------------------------- 测速接口
+ * 页面"网速测试"标签用的三个接口：整块 POST 上传、下载、删除。
+ * 单独测一遍是因为一次 POST 16MB 会让头和body挤在同一个 TCP 段里到达，
+ * 正好覆盖服务端 recv 缓冲放大后的那条路径（HEAD_BUF 只有 8KB，
+ * 多收的 body 塞进头缓冲会被当成畸形请求直接关连接）。 */
+async function testSpeedEndpoints() {
+    console.log('\n--- 测速接口（整块上传 / 下载 / 删除）---');
+    const name = '.speedtest-tmp';
+    const total = 16 * MB;
+    const data = Buffer.alloc(total);
+    for (let i = 0; i < total; i += 4096) data.writeUInt32BE((i / 4096) | 0, i);
+
+    const up = await req('POST',
+        `/api/upload?name=${encodeURIComponent(name)}&size=${total}&offset=0`, data);
+    check('16MB 整块上传返回 200', up.status === 200, `status=${up.status}`);
+    check('整块上传标记为已完成', /"done":true/.test(up.body.toString()));
+
+    const dl = await req('GET', `/api/download?name=${encodeURIComponent(name)}`);
+    check('16MB 下载大小一致', dl.body.length === total, `${dl.body.length} vs ${total}`);
+    check('16MB 下载内容逐字节一致', dl.body.equals(data));
+
+    const del = await json('DELETE', `/api/files?name=${encodeURIComponent(name)}`);
+    check('测速临时文件可删除', del.json && del.json.ok === true, JSON.stringify(del.json));
+    const after = await json('GET', '/api/files');
+    check('删除后不在文件库',
+        !(after.json && after.json.files || []).some((f) => f.name === name));
+}
+
 /* 设备名记忆：刷新/重连不应该换名字。
  * 服务端按 IP 记住上次用过的名字，客户端另有 localStorage 兜底。 */
 async function testNameMemory() {
@@ -639,6 +667,7 @@ async function testNameMemory() {
         await testRange();
         await testNameMemory();
         await testPump();
+        await testSpeedEndpoints();
     } catch (err) {
         failed++;
         console.log(`FAIL  未捕获异常 :: ${err.message}`);
