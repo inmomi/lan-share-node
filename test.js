@@ -603,6 +603,62 @@ async function testPump() {
         dc8.peak >= pump.DRAIN_LIMIT, `peak=${(dc8.peak / MB).toFixed(2)}MB`);
     check('突发发送同样不越 16MB 上限', dc8.peak <= pump.CHROME_DC_QUEUE_CAP,
         `peak=${(dc8.peak / MB).toFixed(2)}MB`);
+
+    /* 9. 并行 lane：区间切分必须首尾相接、不重不漏。
+     *    接收端是直接按 lane 顺序把各段拼回去的，这里漏一段或者重叠一段，
+     *    文件就是坏的——而且是静默损坏，不到打开那一刻发现不了。 */
+    const splitCases = [
+        [0, 16 * MB, 4], [0, 10, 4], [0, 3, 4], [5, 5, 4],
+        [0, 0, 4], [0, 1, 4], [7, 9, 4], [0, 100, 7], [3, 4, 4],
+    ];
+    let splitOk = true;
+    let splitDetail = '';
+    for (const [from, to, n] of splitCases) {
+        const segs = pump.splitRange(from, to, n);
+        let cur = from;
+        for (const s of segs) {
+            if (s.from !== cur || s.to <= s.from) { splitOk = false; splitDetail = `断口@${cur}`; break; }
+            cur = s.to;
+        }
+        if (cur !== to) { splitOk = false; splitDetail = `覆盖到 ${cur} 应为 ${to}`; }
+        if (segs.length > n) { splitOk = false; splitDetail = `段数 ${segs.length} > ${n}`; }
+    }
+    check('区间切分首尾相接且不重不漏', splitOk, splitDetail || '9 组边界全部通过');
+    check('总量不足 lane 数时不出空段',
+        pump.splitRange(0, 3, 4).every((s) => s.to > s.from));
+    check('空区间切出零段', pump.splitRange(5, 5, 4).length === 0);
+    check('lane 数为 0 时退化成 1 段', pump.splitRange(0, 10, 0).length === 1);
+
+    /* 10. 端到端：按 lane 切开、各自 pumpFile、再按 lane 顺序拼回，
+     *     必须和原文件逐字节一致。这条守的是并行传输的正确性——
+     *     end 参数少截一段、某条 lane 多发一段，都会在这里现形。 */
+    const parSize = 12 * MB;
+    const parFile = fakeFile(parSize);
+    const parRanges = pump.splitRange(0, parSize, pump.LANES);
+    const parChans = parRanges.map(() => new FakeDataChannel(pump.CHROME_DC_QUEUE_CAP, 512 * 1024));
+    try {
+        await Promise.all(parRanges.map((r, i) => pump.pumpFile(
+            parChans[i], parFile, r.from, { chunk: 262144, end: r.to }
+        )));
+    } finally {
+        parChans.forEach((c) => c.stop());
+    }
+    /* 每条 lane 收到的字节数必须正好等于它那一段的长度 */
+    const perLaneOk = parRanges.every((r, i) => parChans[i].receivedBytes === r.to - r.from);
+    check('每条 lane 只发自己那一段', perLaneOk,
+        parRanges.map((r, i) => `${i}:${parChans[i].receivedBytes}/${r.to - r.from}`).join(' '));
+    /* 拼回去必须和原文件一致。假通道里存的是 ArrayBuffer，转成 Buffer 再拼。 */
+    const merged = Buffer.concat(parRanges.map((r, i) => Buffer.concat(
+        parChans[i].received.map((ab) => Buffer.from(ab))
+    )));
+    const src = Buffer.alloc(parSize);
+    for (let i = 0; i < parSize; i += 4096) src.writeUInt32BE(i / 4096, i);
+    check('并行分段拼回后与原文件一致', merged.length === parSize && merged.equals(src),
+        `${merged.length} vs ${parSize}`);
+    check('并行发送全程不抛队列满', parChans.every((c) => c.throws === 0));
+    check('并行发送不越 16MB 上限',
+        parChans.every((c) => c.peak <= pump.CHROME_DC_QUEUE_CAP),
+        `peak=${Math.max(...parChans.map((c) => c.peak)) / MB}MB`);
 }
 
 /* ---------------------------------------------------- 测速状态隔离

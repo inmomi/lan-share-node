@@ -38,6 +38,16 @@
      * 16 秒），但又不能无限——见 speedtestCount 里的说明。 */
     const SPEED_TEST_TIMEOUT = 60000;
 
+    /* 每个对端开几条并行的 DataChannel。
+     *
+     * 为什么必须多条：一个 RTCPeerConnection 只有一个 SCTP 关联，拥塞窗口、
+     * 接收窗口、消息粒度全是按关联算的。实测同一对设备 TCP 能跑 30MB/s，
+     * 而单条 DataChannel 只有 3.2MB/s——瓶颈在每关联的机制里，不在链路上。
+     * 多开几条关联（各自 ICE / DTLS / SCTP）才能绕过这个上限，这也相当于
+     * 用户要的"多线程"。注意：同一条关联上开多个 DataChannel 是没用的，
+     * 它们共享同一个拥塞窗口。 */
+    const LANES = 4;
+
     /* 静态自检：高水位加上一块必须明显小于 Chrome 的队列上限，
      * 否则 send() 会在传输中途抛"队列满"。这条断言挡的是"把阈值往上调"这类改动。 */
     if (DRAIN_LIMIT + MAX_CHUNK >= CHROME_DC_QUEUE_CAP) {
@@ -59,6 +69,24 @@
             from += want;
         }
         return plan;
+    }
+
+    /** 把 [from, to) 均切成 n 段连续区间，按 lane 顺序返回 [{ from, to }]。
+     *  约束：首尾相接、不重不漏——接收端按 lane 顺序把各段拼回去就是原文件。
+     *  纯函数，边界（总量不足 n 段、总量为 0、n 为 0）都在这里收敛。 */
+    function splitRange(from, to, n) {
+        const out = [];
+        const total = Math.max(0, (Number(to) || 0) - (Number(from) || 0));
+        const count = Math.max(1, Math.floor(Number(n)) || 1);
+        if (total === 0) return out;
+        const per = Math.ceil(total / count);
+        let cur = Number(from) || 0;
+        for (let i = 0; i < count && cur < to; i++) {
+            const end = Math.min(to, cur + per);
+            out.push({ from: cur, to: end });
+            cur = end;
+        }
+        return out;
     }
 
     /** 读出从 from 开始的那一大块。 */
@@ -120,7 +148,8 @@
     }
 
     /**
-     * 把 file 从 startOffset 开始通过 dc 发完，返回实际发出去的字节数。
+     * 把 file 的 [startOffset, end) 一段通过 dc 发完，返回实际发到哪了。
+     * end 缺省为 file.size——并行传输时每条 lane 只发自己那段，就靠它。
      *
      * 抽成独立函数（而不是留在 app.js 的 sendOne 里）是为了能用假 DataChannel
      * 在 Node 里跑完整回归：假的 dc 只要复现 Chrome 那 16MB 队列上限和泄流速率，
@@ -131,6 +160,8 @@
         hooks = hooks || {};
         const chunk = hooks.chunk || 64 * 1024;
         const onProgress = hooks.onProgress || function () {};
+        /* 只发到这里为止。给并行 lane 切段用；不传就是发到文件末尾。 */
+        const end = Math.min(Math.max(Number(hooks.end) || file.size, 0), file.size);
 
         let offset = Math.max(0, Math.min(Number(startOffset) || 0, file.size));
         onProgress(offset);
@@ -141,7 +172,7 @@
             ? readBlockAt(file, offset + block.byteLength)
             : null;
 
-        while (offset < file.size) {
+        while (offset < end) {
             if (blockPos >= block.byteLength) {
                 block = prefetch ? await prefetch : await readBlockAt(file, offset);
                 blockPos = 0;
@@ -150,7 +181,10 @@
                     : null;
             }
 
-            const buf = block.slice(blockPos, Math.min(blockPos + chunk, block.byteLength));
+            /* 这一块最大能发多少：不能超过单块上限、不能越过本 block 末尾、
+             * 也不能越过 end（并行 lane 只发自己那段，多发的字节会污染文件）。 */
+            const want = Math.min(chunk, block.byteLength - blockPos, end - offset);
+            const buf = block.slice(blockPos, blockPos + want);
             blockPos += buf.byteLength;
             offset += buf.byteLength;
 
@@ -229,8 +263,9 @@
 
     return {
         CHROME_DC_QUEUE_CAP,
-        MAX_CHUNK, DRAIN_LIMIT, LOW_WATER, READ_BLOCK, SPEED_TEST_TIMEOUT,
-        planBlocks, readBlockAt, chunkSizeFor, isRetryableSendError, waitDrain, pumpFile,
+        MAX_CHUNK, DRAIN_LIMIT, LOW_WATER, READ_BLOCK, SPEED_TEST_TIMEOUT, LANES,
+        planBlocks, splitRange, readBlockAt, chunkSizeFor, isRetryableSendError,
+        waitDrain, pumpFile,
         speedtestBegin, speedtestCount, speedtestFinish, speedtestAbort,
     };
 });
