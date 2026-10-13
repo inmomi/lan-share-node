@@ -1,0 +1,17 @@
+{
+  "name": "lan-share",
+  "version": "0.0.1",
+  "private": true,
+  "description": "零依赖的局域网文件互传：WebRTC 直连优先，直连建不起来时自动落到 WebSocket 兜底中转；服务端兼任局域网 STUN。",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js",
+    "test:relay": "node tools/test-relay.js",
+    "test:stun": "node tools/test-stun.js",
+    "e2e": "node tools/p2p-e2e.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

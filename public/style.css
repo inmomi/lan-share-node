@@ -1,0 +1,479 @@
+:root {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --line: #e4e7ec;
+  --line-strong: #d3d8e0;
+  --text: #1f2937;
+  --muted: #6b7280;
+  --faint: #9aa1ac;
+  --blue: #2563eb;
+  --blue-soft: #eef4ff;
+  --green: #0f766e;
+  --green-soft: #e6f5f2;
+  --amber: #b45309;
+  --red: #b91c1c;
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+body {
+  min-height: 100vh;
+  padding-bottom: 48px;
+}
+
+h1, h3 { margin: 0; font-weight: 500; }
+
+/* ------------------------------------------------------------- top bar */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 16px 24px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand { display: flex; align-items: center; gap: 12px; }
+
+.logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: var(--blue);
+  position: relative;
+  flex: none;
+}
+
+.logo::before,
+.logo::after {
+  content: "";
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.logo::before { left: 8px; top: 8px; }
+.logo::after { right: 8px; bottom: 8px; }
+
+.brand-text h1 { font-size: 16px; }
+.brand-text .sub { margin: 0; font-size: 12px; color: var(--muted); }
+
+.me { display: flex; align-items: center; gap: 8px; }
+.me label { font-size: 12px; color: var(--muted); }
+
+.me input {
+  width: 140px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: #fff;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  outline: none;
+}
+
+.me input:focus { border-color: var(--blue); }
+
+.badge {
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--green);
+  background: var(--green-soft);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------------- tabs */
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 12px 24px 0;
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.tab {
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+}
+
+.tab:hover { color: var(--text); }
+
+.tab.active {
+  color: var(--blue);
+  background: var(--card);
+  border-color: var(--line);
+  border-bottom-color: var(--card);
+}
+
+main {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 20px 24px;
+}
+
+.pane { display: none; }
+.pane.active { display: block; }
+
+.hint {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--blue-soft);
+  border-radius: 8px;
+}
+
+/* --------------------------------------------------------- peer grid */
+
+.peer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.peer-card {
+  position: relative;
+  padding: 14px;
+  text-align: left;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color .15s, transform .15s;
+  font: inherit;
+  color: inherit;
+}
+
+.peer-card:hover { border-color: var(--blue); transform: translateY(-1px); }
+.peer-card.dragover { border-color: var(--blue); background: var(--blue-soft); }
+
+.peer-card .avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--blue-soft);
+  color: var(--blue);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.peer-card .pname {
+  font-size: 14px;
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.peer-card .pmeta {
+  font-size: 11px;
+  color: var(--faint);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--line-strong);
+  flex: none;
+}
+
+.dot.live { background: #16a34a; }
+.dot.busy { background: var(--amber); }
+
+.peer-card .mini {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--muted);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.peer-card .mini:hover { color: var(--blue); border-color: var(--blue); }
+
+.empty {
+  grid-column: 1 / -1;
+  padding: 32px;
+  text-align: center;
+  color: var(--faint);
+  font-size: 13px;
+  background: var(--card);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+}
+
+/* ------------------------------------------------------------ transfers */
+
+.transfer-list { margin-top: 20px; display: grid; gap: 10px; }
+
+.transfer {
+  padding: 12px 14px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.t-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.t-name { font-size: 13px; font-weight: 500; word-break: break-all; }
+.t-status { font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+.bar {
+  height: 5px;
+  margin: 8px 0 6px;
+  background: var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.bar i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--blue);
+  border-radius: 999px;
+  transition: width .2s linear;
+}
+
+.transfer.done .bar i { background: var(--green); }
+.transfer.fail .bar i { background: var(--red); }
+
+.t-sub { font-size: 11px; color: var(--faint); }
+
+/* 中断后的「继续」按钮。只在失败/中断的传输行上出现（JS 加 .hidden 控制）。 */
+.t-retry {
+  align-self: flex-start;
+  margin-top: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--blue);
+  background: none;
+  border: 1px solid var(--blue);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.t-retry:hover { background: var(--blue); color: #fff; }
+
+/* --------------------------------------------------------------- vault */
+
+.dropzone {
+  padding: 28px 20px;
+  text-align: center;
+  background: var(--card);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+}
+
+.dropzone.dragover { border-color: var(--blue); background: var(--blue-soft); }
+.dropzone strong { font-weight: 500; }
+.dropzone .or { font-size: 12px; color: var(--faint); }
+.dropzone small { font-size: 11px; color: var(--faint); }
+
+.btn {
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: #fff;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.btn:hover { border-color: var(--blue); color: var(--blue); }
+
+.btn.primary {
+  color: #fff;
+  background: var(--blue);
+  border-color: var(--blue);
+}
+
+.btn.primary:hover { opacity: .9; color: #fff; }
+
+.vault-meta {
+  margin: 14px 0 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.vault-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+
+.vault-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.vault-item .vname {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.vault-item .vmeta { font-size: 11px; color: var(--faint); white-space: nowrap; }
+.vault-item .vact { display: flex; gap: 6px; flex: none; }
+
+.vault-item .vact button {
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--muted);
+  background: #fff;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.vault-item .vact button:hover { color: var(--blue); border-color: var(--blue); }
+.vault-item .vact button.danger:hover { color: var(--red); border-color: var(--red); }
+
+/* -------------------------------------------------------------- toasts */
+
+.toasts {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  display: grid;
+  gap: 8px;
+  z-index: 40;
+}
+
+.toast {
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, .06);
+  animation: pop .2s ease;
+}
+
+@keyframes pop {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* --------------------------------------------------------------- modal */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(17, 24, 39, .35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 20px;
+}
+
+.modal.hidden, .hidden { display: none; }
+
+.modal-card {
+  width: 100%;
+  max-width: 340px;
+  padding: 20px;
+  background: var(--card);
+  border-radius: var(--radius);
+}
+
+.modal-card h3 { font-size: 15px; margin-bottom: 6px; }
+.modal-card p { margin: 0 0 16px; font-size: 13px; color: var(--muted); word-break: break-all; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+@media (max-width: 620px) {
+  .topbar { padding: 12px 16px; }
+  .tabs, main { padding-left: 16px; padding-right: 16px; }
+  .me input { width: 108px; }
+}
+
+/* ---------------------------------------------------------------- 网速测试 */
+
+.speed-panel {
+  margin-top: 14px;
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: 4px 16px;
+}
+
+.speed-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line, rgba(127, 127, 127, .18));
+}
+
+.speed-row:last-of-type { border-bottom: 0; }
+
+.speed-label { font-size: 14px; }
+.speed-label small { color: var(--muted); font-size: 12px; }
+
+.speed-value {
+  font-size: 18px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.speed-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 0;
+  border-top: 1px solid var(--line, rgba(127, 127, 127, .18));
+  flex-wrap: wrap;
+}
+
+.speed-log { font-size: 12px; color: var(--muted); }

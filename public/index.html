@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LAN Share · 局域网文件分享</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"></span>
+    <div class="brand-text">
+      <h1>LAN Share</h1>
+      <p class="sub">局域网点对点直传 + 服务端文件库</p>
+    </div>
+  </div>
+  <div class="me">
+    <label for="myName">本机名称</label>
+    <input id="myName" maxlength="24" spellcheck="false" autocomplete="off">
+    <span id="peerCount" class="badge">0 台设备</span>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="p2p">设备直传</button>
+  <button class="tab" data-tab="vault">服务端文件库</button>
+  <button class="tab" data-tab="speed">网速测试</button>
+</nav>
+
+<main>
+  <section id="pane-p2p" class="pane active">
+    <p class="hint">点击设备卡片选择文件，或把文件直接拖到卡片上。这条路径走浏览器点对点通道，文件内容不经过服务端。</p>
+    <div id="peerGrid" class="peer-grid"></div>
+    <div id="transferList" class="transfer-list"></div>
+  </section>
+
+  <section id="pane-vault" class="pane">
+    <div id="dropzone" class="dropzone">
+      <strong>拖放文件到这里上传</strong>
+      <span class="or">或</span>
+      <button id="pickVault" class="btn">选择文件</button>
+      <small>文件保存在服务端磁盘上，任何设备随时都能下载</small>
+    </div>
+    <div id="vaultMeta" class="vault-meta"></div>
+    <ul id="vaultList" class="vault-list"></ul>
+  </section>
+
+  <section id="pane-speed" class="pane">
+    <p class="hint">
+      分三段测，用来定位瓶颈在哪：<b>服务端下载</b>走 HTTP 从服务端拉，
+      <b>服务端上传</b>走 HTTP 推到服务端，<b>点对点</b>走 WebRTC 直达对方浏览器。
+      三段都慢说明是局域网链路（常见于 2.4G Wi-Fi 或百兆口）的问题，不是软件；
+      只有点对点慢才是浏览器 DataChannel 的问题。
+    </p>
+    <div class="speed-panel">
+      <div class="speed-row">
+        <span class="speed-label">服务端下载</span>
+        <span class="speed-value" id="spDown">—</span>
+      </div>
+      <div class="speed-row">
+        <span class="speed-label">服务端上传</span>
+        <span class="speed-value" id="spUp">—</span>
+      </div>
+      <div class="speed-row">
+        <span class="speed-label">点对点 <small id="spPeerName"></small></span>
+        <span class="speed-value" id="spP2p">—</span>
+      </div>
+      <div class="speed-actions">
+        <button id="runSpeed" class="btn primary">开始测速</button>
+        <span id="speedLog" class="speed-log"></span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<input id="peerPicker" type="file" multiple hidden>
+<input id="vaultPicker" type="file" multiple hidden>
+
+<div id="toasts" class="toasts"></div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <h3 id="modalTitle">收到文件</h3>
+    <p id="modalBody"></p>
+    <div class="modal-actions">
+      <button id="modalNo" class="btn">拒绝</button>
+      <button id="modalYes" class="btn primary">接收</button>
+    </div>
+  </div>
+</div>
+
+<!-- 可选 TURN 中继配置：服务端按 LAN_SHARE_TURN 环境变量在返回首页时，把下面
+     那行 script 里的占位标记替换成一段 JSON 数组（无则留 null，纯内网离线
+     直连）。app.js 的 makeLane 会把它加进 iceServers。
+     注意：占位标记的原文在整个文件里只能出现一次，就是下面那行。服务端的
+     替换命中的是"第一次出现"，所以在注释里再抄一遍原文，注入就会打进注释、
+     而真正要用的那行反而没被替换（页面里就永远是 null）。 -->
+<script>window.__LAN_SHARE_TURN__ = /*__TURN_CONFIG__*/ null;</script>
+<script src="/relay-channel.js"></script>
+<script src="/p2p-pump.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

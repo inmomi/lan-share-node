@@ -1,0 +1,4 @@
+# 统一换行符，避免 Windows 上 checkout 出来的文件带着 CRLF 影响跨平台行为。
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

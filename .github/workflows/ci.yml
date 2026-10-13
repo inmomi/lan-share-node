@@ -1,0 +1,335 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # ------------------------------------------------------------ 快速确定性套件
+  test:
+    name: 端到端测试 (${{ matrix.os }} / Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 只跑 ubuntu 与 windows。macOS 不再单列：测试跑的是纯 Node 代码，
+        # mac 与 linux 在路径/进程这些容易出分歧的地方完全同源（真正的分歧面
+        # 在 Windows，那一档留着），而 mac 的 runner 排队时间常常比整个测试
+        # 本身还长——发版 job 在 needs 里等着它，于是发布会一直卡在一个
+        # "排不上队的 job"上。
+        os: [ubuntu-latest, windows-latest]
+        node: ['22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 语法检查
+        run: |
+          node --check server.js
+          node --check test.js
+          node --check tools/test-relay.js
+          node --check tools/test-stun.js
+
+      # 测试脚本会自己拉起服务、跑完再关掉，避免各平台后台进程写法的差异。
+      # 里面含兜底通道的帧级用例：二进制分片重组、握手与首帧合并写入。
+      - name: 运行端到端测试
+        env:
+          SPAWN: node server.js
+          BASE: http://127.0.0.1:8080
+          TRAVERSAL_PROBE: server.js
+        run: node test.js
+
+      # 兜底通道（WebSocket 中转）单测：帧格式 / 分块上限 / 背压窗口 / close 派发。
+      # 这些边界靠真机点文件点不出来——尤其是"单帧超过服务端上限会被整帧丢弃"
+      # 这一条，现场只会表现为进度条卡死且没有任何报错。
+      - name: 兜底通道单测（relay-channel）
+        run: node tools/test-relay.js
+
+      # 局域网 STUN 的应答校验。它是"直连不依赖 mDNS 组播"这条路的唯一支点，
+      # 而 XOR-MAPPED-ADDRESS 的异或基数、FINGERPRINT 的 CRC 覆盖范围只要错
+      # 一个 bit，浏览器就静默拿不到自反射候选，表现和"服务端没起 STUN"一样。
+      - name: 局域网 STUN 单测
+        run: node tools/test-stun.js
+
+  # ----------------------------------------- 真实双机（netns 模拟两设备直连）T1
+  two-host-lan:
+    name: 两主机 LAN（netns 真实 IP 直连）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装 / 定位 Chrome
+        run: |
+          set -e
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
+            curl -fsSL --max-time 300 -o chrome.deb \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+            sudo apt-get install -y -qq ./chrome.deb
+          fi
+          FOUND=""
+          for c in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then FOUND=$(command -v "$c"); break; fi
+          done
+          if [ -z "$FOUND" ]; then echo "::error::Chrome 装上了但不在 PATH 里"; exit 1; fi
+          export CHROME_PATH="$FOUND"
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
+
+      # netns 搭建 + 浏览器测试需要 root。注意：sudo 默认会把 PATH 重置为
+      # secure_path，不含 setup-node 装的 node，所以用 `env PATH="$PATH"` 把当前
+      # （含 node）的 PATH 透传进去；CHROME_PATH 经 sudo -E 透传。
+      # --no-mdns-bypass：按真实浏览器的默认行为跑（开 mDNS 候选伪装）。
+      # 之前测试一直关着它，等于把真机上最常见的故障机制屏蔽掉——同一路由器
+      # 同 SSID 的两台设备能看到对方却建不起直连，就是 mDNS 解析不出来。
+      # 开着它还能直连，靠的是服务端自带的局域网 STUN 给的 srflx 真实 IP 候选
+      # （日志里会打出"链路诊断: host↔srflx"）。
+      #
+      # 吞吐下限按这一档 CI 实测基线定。开 mDNS 之后候选要等 mDNS 解析超时、
+      # ICE 收敛更慢，2 核 VM 上同时跑两个 Chrome 时端到端会明显低于关闭 mDNS
+      # 的老基线（22MB/s）——两者不是同一个场景，不要拿老数字当合格线。
+      - name: netns 两机直连 + 浏览器 e2e（T1，必须走直连）
+        run: |
+          set -e
+          sudo -E env PATH="$PATH" bash -c '
+            set -e
+            export CHROME_PATH="$CHROME_PATH"
+            COTURN=0 bash tools/ci-realnet.sh setup
+            set -a; . ./realnet.env; set +a
+            UPLOAD_DIR=/tmp/lanshare-t1-uploads PORT="$SERVER_PORT" \
+              node server.js >/tmp/lanshare.log 2>&1 &
+            SRV=$!
+            sleep 2
+            # 服务端可达性自检：从两个 ns 各探一次，路由接错立刻现形
+            ip netns exec nsA curl -sf -o /dev/null --max-time 5 "http://$GW_A:$SERVER_PORT/" \
+              && echo "nsA 可达服务端 OK" || { echo "::error::nsA 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            ip netns exec nsB curl -sf -o /dev/null --max-time 5 "http://$GW_B:$SERVER_PORT/" \
+              && echo "nsB 可达服务端 OK" || { echo "::error::nsB 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            echo "---- 服务端启动日志 /tmp/lanshare.log ----"
+            head -20 /tmp/lanshare.log 2>/dev/null || true
+            node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
+              --server-url-b "$SERVER_URL_B" \
+              --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
+              --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
+              --devtools-port-a "$DEVTOOLS_PORT_A" --devtools-port-b "$DEVTOOLS_PORT_B" \
+              --no-mdns-bypass --require-mode p2p \
+              --file-mb 64 --timeout 240 --label ci-lan --throughput-floor 4
+            kill $SRV 2>/dev/null || true
+          '
+
+  # -------------------------- 真实双机 + AP 隔离 + TURN 中继（关键闸门）T2
+  isolated-relay:
+    name: AP 隔离 + TURN 中继（必须走中继）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装 / 定位 Chrome
+        run: |
+          set -e
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
+            curl -fsSL --max-time 300 -o chrome.deb \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+            sudo apt-get install -y -qq ./chrome.deb
+          fi
+          FOUND=""
+          for c in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then FOUND=$(command -v "$c"); break; fi
+          done
+          if [ -z "$FOUND" ]; then echo "::error::Chrome 装上了但不在 PATH 里"; exit 1; fi
+          export CHROME_PATH="$FOUND"
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
+
+      # 隔离 + 起 coturn；服务端按 LAN_SHARE_TURN 把 TURN 注入页面。
+      # 直连被 DROP，连接必须经由中继成功建立并完整传文件。
+      - name: netns 隔离 + TURN 中继 + 浏览器 e2e（T2，关键闸门）
+        run: |
+          set -e
+          sudo -E env PATH="$PATH" bash -c '
+            set -e
+            export CHROME_PATH="$CHROME_PATH"
+            COTURN=1 bash tools/ci-realnet.sh setup isolate
+            set -a; . ./realnet.env; set +a
+            LAN_SHARE_TURN="$LAN_SHARE_TURN" UPLOAD_DIR=/tmp/lanshare-t2-uploads \
+              PORT="$SERVER_PORT" node server.js >/tmp/lanshare.log 2>&1 &
+            SRV=$!
+            sleep 2
+            ip netns exec nsA curl -sf -o /dev/null --max-time 5 "http://$GW_A:$SERVER_PORT/" \
+              && echo "nsA 可达服务端 OK" || { echo "::error::nsA 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            ip netns exec nsB curl -sf -o /dev/null --max-time 5 "http://$GW_B:$SERVER_PORT/" \
+              && echo "nsB 可达服务端 OK" || { echo "::error::nsB 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            # 先看服务端到底把什么发给了浏览器：TURN 注入生没生效，一眼可见。
+            # 页面里 window.__LAN_SHARE_TURN__ 一直是 null，靠这里定位是
+            # "服务端没拿到环境变量" 还是 "拿到了但替换没命中"。必须放在 e2e
+            # 之前——set -e 下 e2e 一失败就退出了，放后面永远打不出来。
+            # 注意：整个脚本被包在 bash -c '...' 里，里面绝对不能用单引号，
+            # 否则会提前闭合外层引号。一律用双引号。
+            echo "---- 服务端返回首页：占位符是否还在 / 是否已注入 TURN ----"
+            ip netns exec nsA curl -s "http://$GW_A:$SERVER_PORT/" > /tmp/served-index.html
+            wc -c < /tmp/served-index.html
+            grep -c "TURN_CONFIG" /tmp/served-index.html || echo "(首页已无 TURN_CONFIG 占位符，说明替换过)"
+            grep -o "turn:[^\"]*" /tmp/served-index.html | head -2 || echo "(首页里没有 turn: URL)"
+            grep -o "window.__LAN_SHARE_TURN__.\{0,90\}" /tmp/served-index.html || echo "(没抓到赋值语句)"
+            echo "---- 服务端启动日志 /tmp/lanshare.log ----"
+            head -25 /tmp/lanshare.log 2>/dev/null || true
+            node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
+              --server-url-b "$SERVER_URL_B" \
+              --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
+              --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
+              --devtools-port-a "$DEVTOOLS_PORT_A" --devtools-port-b "$DEVTOOLS_PORT_B" \
+              --require-mode p2p \
+              --file-mb 64 --timeout 240 --label ci-isorel --throughput-floor 2
+            kill $SRV 2>/dev/null || true
+          '
+
+  # ---------------------------- 直连彻底不可用 → WebSocket 兜底（T3，保底闸门）
+  # 禁掉两子网之间的 UDP，同时开着 mDNS 伪装：ICE 无论有多少候选都不可能建起来。
+  # 这一档回答的是"最坏情况下还能不能传"——信令是 TCP，兜底通道走同一条链，
+  # 所以必须仍然能把文件完整传到、且字节校验一致。少了这一档，前面几档全绿
+  # 也可能只是"恰好这条网能直连"。
+  relay-fallback:
+    name: 直连不可用 → WebSocket 兜底（必须仍能传）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装 / 定位 Chrome
+        run: |
+          set -e
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
+            curl -fsSL --max-time 300 -o chrome.deb \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+            sudo apt-get install -y -qq ./chrome.deb
+          fi
+          FOUND=""
+          for c in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then FOUND=$(command -v "$c"); break; fi
+          done
+          if [ -z "$FOUND" ]; then echo "::error::Chrome 装上了但不在 PATH 里"; exit 1; fi
+          export CHROME_PATH="$FOUND"
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
+
+      - name: 禁 UDP + 开 mDNS 伪装，验证兜底通道（T3）
+        run: |
+          set -e
+          sudo -E env PATH="$PATH" bash -c '
+            set -e
+            export CHROME_PATH="$CHROME_PATH"
+            COTURN=0 bash tools/ci-realnet.sh setup noudp
+            set -a; . ./realnet.env; set +a
+            UPLOAD_DIR=/tmp/lanshare-t3-uploads PORT="$SERVER_PORT" \
+              node server.js >/tmp/lanshare.log 2>&1 &
+            SRV=$!
+            sleep 2
+            ip netns exec nsA curl -sf -o /dev/null --max-time 5 "http://$GW_A:$SERVER_PORT/" \
+              && echo "nsA 可达服务端 OK" || { echo "::error::nsA 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            ip netns exec nsB curl -sf -o /dev/null --max-time 5 "http://$GW_B:$SERVER_PORT/" \
+              && echo "nsB 可达服务端 OK" || { echo "::error::nsB 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            # UDP 必须真的被禁掉，否则这一档就退化成普通直连用例。
+            # 不能用 echo > /dev/udp/... 去探：UDP 无连接，写出去永远"成功"，
+            # 探了也是假通过。直接查规则在不在。
+            if iptables -C FORWARD -s "$SUBNET_A" -d "$SUBNET_B" -p udp -j DROP 2>/dev/null \
+               && iptables -C FORWARD -s "$SUBNET_B" -d "$SUBNET_A" -p udp -j DROP 2>/dev/null; then
+              echo "UDP 已禁：FORWARD 链上两子网间 UDP DROP 规则在位（符合预期）"
+            else
+              echo "::error::UDP 未被禁掉，本用例失去意义"
+              kill $SRV 2>/dev/null; exit 1
+            fi
+            echo "---- 服务端启动日志 ----"
+            head -20 /tmp/lanshare.log 2>/dev/null || true
+            # 必须临时关掉 set -e：否则 e2e 一失败脚本立刻退出，下面这些
+            # 诊断永远打不出来，就只能靠猜。
+            set +e
+            node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
+              --server-url-b "$SERVER_URL_B" \
+              --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
+              --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
+              --devtools-port-a "$DEVTOOLS_PORT_A" --devtools-port-b "$DEVTOOLS_PORT_B" \
+              --no-mdns-bypass --require-mode relay \
+              --file-mb 32 --timeout 300 --label ci-fallback --throughput-floor 1
+            RC=$?
+            set -e
+            echo "---- e2e 退出码 $RC ----"
+            echo "---- 服务端还活着吗 ----"
+            if pgrep -f "node server.js" >/dev/null; then echo "服务端仍在运行"; else echo "服务端已退出（崩溃或被杀）"; fi
+            echo "---- 服务端日志尾部（找 中转 进度 / 关闭连接 原因）----"
+            tail -40 /tmp/lanshare.log 2>/dev/null || true
+            kill $SRV 2>/dev/null || true
+            exit $RC
+          '
+
+  # Windows 打包仅供双击启动，不参与测试（CI 里已通过 start 脚本等价覆盖）
+  smoke-windows-bat:
+    name: 启动脚本可运行 (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 通过 start.bat 启动并验证
+        shell: cmd
+        env:
+          TEST_URL: http://127.0.0.1:8080
+        run: |
+          start "" /B cmd /c start.bat
+          powershell -Command "$ok=$false; for($i=0;$i -lt 30;$i++){ Start-Sleep -Seconds 1; try{ $r=Invoke-WebRequest -Uri $env:TEST_URL -UseBasicParsing -TimeoutSec 3; if($r.StatusCode -eq 200){ $ok=$true; break } }catch{} }; if(-not $ok){ exit 1 }"
+          taskkill /F /IM node.exe
+
+  # ------------------------------------------------------------------- 发布
+  # Node 版没有编译步骤，"二进制"就是这份源码——打 tag 时先把上面所有闸门
+  # 跑一遍作为发布门槛（与 C 版 build.yml 的 release 同构），再把源码打包成
+  # zip 附到 Release 上。
+  release:
+    name: 发布 Release
+    needs: [test, two-host-lan, isolated-relay, relay-fallback]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 打源码包（排除 .git 与本地上传目录）
+        run: |
+          set -e
+          mkdir -p dist/lan-share
+          git archive --format=tar HEAD | tar -x -C dist/lan-share
+          cd dist
+          zip -qr - lan-share > lan-share-node-src.zip
+          sha256sum lan-share-node-src.zip | tee lan-share-node-src.zip.sha256
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/lan-share-node-src.zip
+            dist/lan-share-node-src.zip.sha256
+          generate_release_notes: true
