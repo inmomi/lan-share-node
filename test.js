@@ -572,7 +572,9 @@ async function testPump() {
      *    这条用例不测时间（测时间在 CI 上会flaky），测的是确定性结构：
      *    两次等待之间是同步发送，泄流计时器插不进来，所以必然出现一段
      *    "连续多发且中间零泄流"的突发。旧写法每发一块前都真等一次，
-     *    突发长度只有 1~3 块；新写法从低水位填到高水位，突发 ≥ 8 块。
+     *    突发长度只有 1~2 块；新写法从低水位填到高水位，突发接近整个
+     *    窗口（块数 = (DRAIN_LIMIT-LOW_WATER)/块大小，期望值从当前阈值
+     *    推导，不写死——高水位调整时期望跟着变）。
      *    故意用慢速假通道（16KB/ms），让旧写法的轮询粒度充分暴露。 */
     const file8 = fakeFile(8 * MB);
     const dc8 = new FakeDataChannel(pump.CHROME_DC_QUEUE_CAP, 16 * 1024);
@@ -596,9 +598,12 @@ async function testPump() {
         burst = (log[i] === log[i - 1] + chunk) ? burst + 1 : 1;
         if (burst > maxBurst) maxBurst = burst;
     }
+    /* 窗口能装多少块：(DRAIN_LIMIT-LOW_WATER)/块大小，再加入口那块。
+     * 期望达到窗口的 60%（至少 3 块）——旧写法的 1~2 块会被抓出来。 */
     const wantBurst = Math.floor((pump.DRAIN_LIMIT - pump.LOW_WATER) / chunk);
-    check('窗口未打满时连续发送（不等轮询）', maxBurst >= 8,
-        `最长突发 ${maxBurst} 块（期望 ≥ 8，理论上限 ${wantBurst + 1}）`);
+    const minBurst = Math.max(3, Math.ceil((wantBurst + 1) * 0.6));
+    check('窗口未打满时连续发送（不等轮询）', maxBurst >= minBurst,
+        `最长突发 ${maxBurst} 块（期望 ≥ ${minBurst}，理论上限 ${wantBurst + 1}）`);
     check('确实打满过高水位（不是一直在低水位发）',
         dc8.peak >= pump.DRAIN_LIMIT, `peak=${(dc8.peak / MB).toFixed(2)}MB`);
     check('突发发送同样不越 16MB 上限', dc8.peak <= pump.CHROME_DC_QUEUE_CAP,

@@ -366,7 +366,7 @@ function waitAccept(tid) {
 /** 单块大小。Chrome 的 sctp.maxMessageSize 默认 262144，超过 send() 会直接抛错。 */
 
 async function sendOne(peerId, file) {
-  const { live } = await ensureChannel(peerId);
+  const { conn, live } = await ensureChannel(peerId);
   const tid = makeId();
   const fileId = fileIdOf(file.name, file.size, file.lastModified);
 
@@ -382,12 +382,18 @@ async function sendOne(peerId, file) {
   });
   rec.fileId = fileId;
 
-  /* 控制消息走第一条活 lane，数据随后按范围铺到所有活 lane 上。
+  /* 这条链路用几条 lane：首次传输前探一次（probeLanes），之后按探测结果
+   * 和实测表现动态调整。只广告真正会用的 lane——对端按交集数段数，
+   * 广告 32 条却只用 16 条，对端会永远等不到收尾。 */
+  const want = await chooseLanes(conn, live);
+  const chosen = live.slice(0, want);
+
+  /* 控制消息走第一条活 lane，数据随后按范围铺到所用 lane 上。
    * lanes 带上本端活着的 lane 编号：对端用自己的活lane 集合取交集，
    * 两边段数才能对齐（任何一边少一条 lane，写死 LANES 就会永远等不到收尾）。 */
-  live[0].dc.send(JSON.stringify({
+  chosen[0].dc.send(JSON.stringify({
     t: 'file-offer', tid, fileId, name: file.name, size: file.size,
-    lanes: live.map((l) => l.index),
+    lanes: chosen.map((l) => l.index),
   }));
 
   const accept = await waitAccept(tid);
@@ -398,10 +404,11 @@ async function sendOne(peerId, file) {
 
   const start = accept.offset || 0;
   /* 双方活 lane 的交集才是真能用的：发送端活着但接收端已死的 lane，
-   * 字节发过去直接进黑洞，接收端永远等不到那条 lane-end。 */
+   * 字节发过去直接进黑洞，接收端永远等不到那条 lane-end。
+   * 注意是在 chosen（本次实际使用的子集）里取交集，不是全部活 lane。 */
   const use = accept.lanes
-    ? live.filter((l) => accept.lanes.includes(l.index))
-    : live;
+    ? chosen.filter((l) => accept.lanes.includes(l.index))
+    : chosen;
   if (!use.length) throw new Error('对端没有可用的传输通道');
   /* 把 [start, size) 均分给活 lane。段与段首尾相接，接收端按 lane 顺序
    * 拼回去就是原文件——所以这里切的顺序不能乱，也不能漏段。
@@ -415,6 +422,7 @@ async function sendOne(peerId, file) {
     updateTransfer(tid, { sent: total, status: '传输中' });
   };
 
+  const sendStart = Date.now();
   await Promise.all(ranges.map((range, i) => {
     if (range.to <= range.from) return Promise.resolve();
     const lane = use[i];
@@ -434,7 +442,18 @@ async function sendOne(peerId, file) {
     });
   }));
 
-  updateTransfer(tid, { status: '已送达', sent: file.size, done: true });
+  /* 这一趟的对端实收速率（progress 回执算出来的）如果明显慢，下次给同一
+   * 对端直接加满 lane——链路变差不用等下次探测。只升不降，避免抖动。 */
+  const moved = Math.max(0, rec.acked - start);
+  const secs = (Date.now() - sendStart) / 1000;
+  if (moved > 4 * 1024 * 1024 && secs > 0.5
+    && moved / secs < ESCALATE_BELOW && conn.lanePref < live.length) {
+    conn.lanePref = live.length;
+  }
+
+  /* 全部 lane-end 都已发出，对端收齐即组装落盘——此时进度条直接拉满，
+   * 不用等最后一条 progress 回执（它可能还在链路上）。 */
+  updateTransfer(tid, { status: '已送达', sent: file.size, acked: file.size, done: true });
 }
 
 function enqueueSend(peerId, file) {
@@ -463,6 +482,10 @@ function onChannelMessage(lane, data) {
     }
     if (msg.t === 'file-offer') {
       askReceive(lane, msg);
+    } else if (msg.t === 'progress') {
+      /* 对端汇报实收字节数。发送端的进度条和速率以它为准——
+       * 本端的 sent 只是"交给发送队列"的字节，会被高水位吸收而虚高。 */
+      updateTransfer(msg.tid, { acked: Number(msg.received) || 0 });
     } else if (msg.t === 'file-accept' || msg.t === 'file-reject') {
       const resolve = state.pendingAccept.get(msg.tid);
       if (resolve) {
@@ -514,6 +537,19 @@ function onChannelMessage(lane, data) {
     inc.laneBufs[lane.index].push(data);
     inc.received += data.byteLength;
     updateTransfer(inc.tid, { sent: inc.received });
+    /* 周期性回传实收字节数：发送端的进度和速率用它来显示。
+     * 不这么做的话，发送端只能显示"交给发送队列的字节"——那会被 lane 的
+     * 高水位吸收（32 条 × 2MB = 64MB），进度条先冲到 100% 再卡住，
+     * 速率在 2~40MB/s 之间荡，而真实速度一直很稳。 */
+    const now = Date.now();
+    if (inc.received - (inc.lastAck || 0) >= 1024 * 1024
+      || now - (inc.lastAckTs || 0) >= 500) {
+      inc.lastAck = inc.received;
+      inc.lastAckTs = now;
+      try {
+        lane.dc.send(JSON.stringify({ t: 'progress', tid: inc.tid, received: inc.received }));
+      } catch (_) { /* 通道正在关，下一条数据也到不了了 */ }
+    }
   }
 }
 
@@ -570,6 +606,9 @@ async function askReceive(lane, msg) {
     lanesDone: 0,
     expectedLanes: splitRange(already, msg.size, useCount).length,
     received: already,
+    /* progress 回执的节流状态：每 1MB 或 500ms 报一次实收字节数 */
+    lastAck: already,
+    lastAckTs: 0,
   };
   state.incoming = inc;
   if (inc.fileId) state.resume.set(inc.fileId, inc);
@@ -639,6 +678,9 @@ function addTransfer(info) {
     el,
     size: info.size,
     sent: 0,
+    /* 对端实收字节（发送端才有，progress 回执刷新）。null 表示还没收到
+     * 第一条回执——那之前只能先显示本端交付量。 */
+    acked: null,
     status: '准备中',
     dir: info.dir,
     peerId: info.peerId || null,
@@ -656,23 +698,25 @@ function addTransfer(info) {
 }
 
 /* 进度更新改成节流。原来每收/发一块就写一次 DOM，100MB 的文件要动一千多次，
- * 光重排就把主线程占住了，反而拖慢传输。统一 120ms 批量刷一次。 */
+ * 光重排就把主线程占住了，反而拖慢传输。统一 120ms 批量刷一次。
+ * 速率按"显示值"（发送端是 acked，接收端是 sent）的变化算，见 renderTransfer。 */
 function updateTransfer(tid, patch) {
   const rec = state.transfers.get(tid);
   if (!rec) return;
   Object.assign(rec, patch);
 
-  if (typeof patch.sent === 'number') {
+  const shown = rec.acked != null ? rec.acked : rec.sent;
+  if (typeof patch.sent === 'number' || typeof patch.acked === 'number') {
     const now = Date.now();
     if (!rec.lastTs) {
       rec.lastTs = now;
-      rec.lastSent = rec.sent;
+      rec.lastSent = shown;
     } else {
       const dt = (now - rec.lastTs) / 1000;
       if (dt >= 0.4) {
-        rec.speed = Math.max(0, (rec.sent - rec.lastSent) / dt);
+        rec.speed = Math.max(0, (shown - rec.lastSent) / dt);
         rec.lastTs = now;
-        rec.lastSent = rec.sent;
+        rec.lastSent = shown;
       }
     }
   }
@@ -682,15 +726,18 @@ function updateTransfer(tid, patch) {
 function renderTransfer(tid) {
   const rec = state.transfers.get(tid);
   if (!rec) return;
-  const pct = rec.size ? Math.min(100, Math.round((rec.sent / rec.size) * 100)) : (rec.done ? 100 : 0);
+  /* 发送端有对端回执时按实收显示：进度条不再被发送队列吸收而虚高，
+   * 速率也不再荡。没有回执（刚发起、对端是老版本）才退回本端交付量。 */
+  const shown = rec.acked != null ? rec.acked : rec.sent;
+  const pct = rec.size ? Math.min(100, Math.round((shown / rec.size) * 100)) : (rec.done ? 100 : 0);
   const who = rec.peerLabel || (rec.peerId ? peerName(rec.peerId) : '');
   const speed = rec.speed > 0 ? ` · ${humanSpeed(rec.speed)}` : '';
 
   rec.el.querySelector('.bar i').style.width = `${pct}%`;
   rec.el.querySelector('.t-status').textContent = rec.status || `${pct}%`;
   rec.el.querySelector('.t-sub').textContent = rec.dir === 'down'
-    ? `来自 ${who} · ${humanSize(rec.sent)} / ${humanSize(rec.size)}${speed}`
-    : `发往 ${who} · ${humanSize(rec.sent)} / ${humanSize(rec.size)}${speed}`;
+    ? `来自 ${who} · ${humanSize(shown)} / ${humanSize(rec.size)}${speed}`
+    : `发往 ${who} · ${humanSize(shown)} / ${humanSize(rec.size)}${speed}`;
   rec.el.classList.toggle('done', Boolean(rec.done));
   rec.el.classList.toggle('fail', Boolean(rec.failed));
   rec.el.querySelector('.t-retry').classList.toggle('hidden', !(rec.failed && rec.retry));
@@ -1048,22 +1095,20 @@ async function linkDiag(pc) {
  * 为什么要并行着测：单条 DataChannel 只有 3.2MB/s，而同一对设备的 TCP 能跑
  * 30MB/s——瓶颈在单个 SCTP 关联里（拥塞窗口/接收窗口/消息粒度），不在链路上。
  * 只测一条的话，测出来的只是关联的上限，会误判成"网络不行"。 */
-async function speedP2p(peerId) {
-  const { live } = await ensureChannel(peerId);
+/* 在指定的一组 lane 上跑一次逐 lane 测速：握手 → 泵数据 → 等对端回执。
+ * speedP2p（页面上的测速按钮）和 chooseLanes（传输前的 lane 数决策）用的是
+ * 同一套机制，只有 lane 子集和字节数不同，所以抽成公共函数。
+ * 速率由对端计时（speedtest-result 回执），不受发送队列吸收影响。 */
+async function laneSpeedtest(lanes, totalBytes, blob) {
   const t0 = performance.now();
-
-  const diag = await linkDiag(live[0].pc);
-  speedLog(`链路：${diag.text}`);
-
-  const blob = new Blob([new Uint8Array(SPEED_BYTES)]);
   /* 和真实传输用同一个切分函数，段数、边界完全一致 */
-  const ranges = splitRange(0, SPEED_BYTES, live.length);
-  const lanes = live.slice(0, ranges.length);
+  const ranges = splitRange(0, totalBytes, lanes.length);
+  const use = lanes.slice(0, ranges.length);
 
   /* 每条 lane 独立打招呼：发 speedtest、等对端 ready。
    * 丢包链路上这条控制消息自己就可能丢（用户 Wi-Fi 实测 2% 丢包时必中），
    * 所以每 2 秒重发一次、最多等 30 秒——不能一丢就判整个测速失败。 */
-  await Promise.all(lanes.map((lane, i) => new Promise((resolve, reject) => {
+  await Promise.all(use.map((lane, i) => new Promise((resolve, reject) => {
     let tries = 0;
     const send = () => {
       tries++;
@@ -1097,7 +1142,7 @@ async function speedP2p(peerId) {
   })));
 
   /* 等每条 lane 的回执。超时给 null，不影响其他 lane 出数 */
-  const echoes = lanes.map((lane) => new Promise((resolve) => {
+  const echoes = use.map((lane) => new Promise((resolve) => {
     const to = setTimeout(() => resolve(null), 120000);
     const onMsg = (e) => {
       if (typeof e.data !== 'string') return;
@@ -1114,7 +1159,7 @@ async function speedP2p(peerId) {
 
   try {
     await Promise.all(ranges.map((r, i) => {
-      const lane = lanes[i];
+      const lane = use[i];
       return pumpFile(lane.dc, blob.slice(r.from, r.to), 0, { chunk: chunkSizeFor(lane) })
         .then(() => {
           lane.dc.send(JSON.stringify({ t: 'speedtest-end', ch: lane.index }));
@@ -1123,29 +1168,81 @@ async function speedP2p(peerId) {
   } catch (err) {
     /* 没能正常收尾一定要告诉对端，否则它会一直停在计数状态，
      * 把后续真实文件的分块全吞掉。 */
-    for (const lane of lanes) {
+    for (const lane of use) {
       try { lane.dc.send(JSON.stringify({ t: 'speedtest-abort', ch: lane.index })); } catch (_) {}
     }
     throw err;
   }
 
   const results = await Promise.all(echoes);
-  const secs = (performance.now() - t0) / 1000;
+  const received = results.reduce((n, r) => n + (r ? r.received : 0), 0);
+  /* 并行时取最慢那条 lane 的耗时当分母，偏保守但不会虚高 */
+  const slowest = results.reduce((mx, r) => Math.max(mx, r ? r.ms : 0), 0);
+  return {
+    received, slowest,
+    secs: (performance.now() - t0) / 1000,
+    perLane: results.map((r) => (r && r.ms > 0 ? (r.received / 1048576) / (r.ms / 1000) : 0)),
+  };
+}
+
+/* ---------------- lane 数决策：16 条探一次，慢才加开到 32 ----------------
+ *
+ * CI 实测（--sweep，速率由对端计时）表明最优 lane 数随链路丢包变化：
+ *   无损 loopback：1~4 条就够（26~39MB/s），16/32 条回落到 16~18；
+ *   5ms + 0.5% 丢包：16 条 20.0 > 32 条 17.1——轻度丢包 16 条最优；
+ *   20ms + 2% 丢包：16 条 3.0 < 32 条 4.2——重丢包才吃得上 32 条。
+ * 而且多开 lane 不是免费的：每条关联都有独立的 DTLS/SCTP 开销，Chrome 的
+ * DataChannel 通路是 CPU-bound 的（Aalto 大学实测：高端 PC 上双端各吃满一个
+ * 核，且接收端比发送端更耗 CPU），32 条在轻度丢包的 Wi-Fi 上等于拿 CPU 和
+ * 空口控制帧换一点点带宽。所以先用 16 条探 4MB：对端聚合 ≥10MB/s 就用
+ * 16 条（省 CPU、发送队列吸收窗口小、数字稳），低于阈值才加满到 32 条。
+ *
+ * 阈值 10MB/s 在三档 CI 档案上都分得开：0.5% 丢包的 16 条聚合是 20（不升），
+ * 2% 丢包是 3.0（升），无损是 16~29（不升）。 */
+const PROBE_LANES = 16;
+const PROBE_BYTES = 4 * 1024 * 1024;
+const ESCALATE_BELOW = 10 * 1024 * 1024;
+
+/** 本次传输用几条 lane。探测结果按连接缓存（conn.lanePref）——
+ *  同一对端第二次发文件不再重新探，链路变化由 sendOne 末尾的实收速率兜底
+ *  （明显慢就加满，只升不降，避免抖动）。 */
+async function chooseLanes(conn, live) {
+  if (conn.lanePref) return Math.min(conn.lanePref, live.length);
+  const lanes = live.slice(0, PROBE_LANES);
+  let agg = 0;
+  try {
+    const blob = new Blob([new Uint8Array(PROBE_BYTES)]);
+    const r = await laneSpeedtest(lanes, PROBE_BYTES, blob);
+    agg = r.slowest > 0 ? (r.received / 1048576) / (r.slowest / 1000) : 0;
+  } catch (_) {
+    /* 探测本身失败（链路很差才会）——按最坏情况办，直接加满 */
+    conn.lanePref = live.length;
+    return live.length;
+  }
+  conn.lanePref = agg < 10 ? live.length : PROBE_LANES;
+  return conn.lanePref;
+}
+
+async function speedP2p(peerId) {
+  const { live } = await ensureChannel(peerId);
+
+  const diag = await linkDiag(live[0].pc);
+  speedLog(`链路：${diag.text}`);
+
+  const blob = new Blob([new Uint8Array(SPEED_BYTES)]);
+  const r = await laneSpeedtest(live, SPEED_BYTES, blob);
   /* 两个数字的含义不同：
    *   mbps       —— 本机把字节交给 DataChannel 的速率，含背压等待，
-   *                 也就是"我这边发得多快"。
-   *   peerMbps   —— 对端真正收完的速率，由对端计时，这才是端到端速度。
-   * 背压存在时本机数字会被等待拉低，所以以对端数字为准。
-   * 并行时取最慢那条 lane 的耗时当分母，偏保守，但不会虚高。 */
-  const received = results.reduce((n, r) => n + (r ? r.received : 0), 0);
-  const slowest = results.reduce((mx, r) => Math.max(mx, r ? r.ms : 0), 0);
-  const peerMbps = slowest > 0 ? (received / 1048576) / (slowest / 1000) : 0;
+   *                 也就是"我这边发得多快"。它会被发送队列吸收（每条 lane
+   *                 最多囤 2MB，32 条就是 64MB），链路一抖动就虚高，
+   *                 只能看趋势。
+   *   peerMbps   —— 对端真正收完的速率，由对端计时，这才是端到端速度。 */
   return {
-    mbps: SPEED_BYTES / 1048576 / secs,
-    peerMbps,
-    lanes: lanes.length,
+    mbps: SPEED_BYTES / 1048576 / r.secs,
+    peerMbps: r.slowest > 0 ? (r.received / 1048576) / (r.slowest / 1000) : 0,
+    lanes: live.length,
     diag,
-    echoed: received > 0 ? { received, ms: slowest } : null,
+    echoed: r.received > 0 ? { received: r.received, ms: r.slowest } : null,
   };
 }
 
@@ -1171,18 +1268,19 @@ async function runSpeedTest() {
 
     if (peer) {
       const p2p = await speedP2p(peer.id);
-      /* 对端确认的速率才是端到端真实速度；本机速率只是"交付出手"的速度，
-       * 背压等待会把它压低。两个都显示，方便判断是谁在等。 */
+      /* 头条用对端确认的速率：那才是端到端真实速度。本机"交付出手"的速率
+       * 会被发送队列吸收（每条 lane 最多囤 2MB，32 条就是 64MB 的吸收
+       * 窗口），链路一抖动就虚高——用户实测发送端在 2~40MB/s 之间荡、
+       * 对端却一直稳定 13MB/s，荡的就是这个数。两个都显示，但主次分明。 */
       const extra = p2p.echoed
-        ? ` · 对端收到 ${(p2p.echoed.received / 1048576).toFixed(1)}MB`
-          + ` @ ${p2p.peerMbps.toFixed(1)} MB/s`
+        ? ` · 本端交付 ${p2p.mbps.toFixed(1)}`
         : ' · 对端未回执';
-      speedSet('spP2p', `${p2p.mbps.toFixed(1)} MB/s${extra} · ${p2p.lanes} 条并行`);
+      speedSet('spP2p', `${p2p.peerMbps.toFixed(1)} MB/s${extra} · ${p2p.lanes} 条并行`);
       /* 单条 lane 的速率也报一下：并行没提升就说明瓶颈不在每关联的机制上，
        * 而在链路本身，继续加 lane 是徒劳。 */
       if (p2p.lanes > 1) {
-        speedLog(`点对点并行：${p2p.lanes} 条 lane 合计 ${p2p.mbps.toFixed(1)} MB/s`
-          + `（单条约 ${(p2p.mbps / p2p.lanes).toFixed(1)} MB/s）`);
+        speedLog(`点对点并行：${p2p.lanes} 条 lane 对端合计 ${p2p.peerMbps.toFixed(1)} MB/s`
+          + `（本端交付 ${p2p.mbps.toFixed(1)}）`);
       }
     } else {
       speedSet('spP2p', '跳过（没有在线设备）');

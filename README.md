@@ -14,11 +14,13 @@
 
 两条路径都支持断点续传：直传中断后重发会接着上次的字节偏移继续；文件库上传按偏移续写 `.part` 半成品；下载走 HTTP Range，浏览器原生续传。设备名在浏览器本地存一份、服务端再按 IP 记一份，刷新页面、重连都不会变回随机名。
 
-**关于速度**：P2P 直传走 WebRTC DataChannel，有两条浏览器硬限制——单条消息不能超过 `sctp.maxMessageSize`（Chrome 默认 256KB），发送队列总共只有约 16MB，`bufferedAmount` 一超过 `send()` 就直接抛 `RTCDataChannel send queue is full`（不是排队，是抛异常）。 pacing 逻辑集中在 `public/p2p-pump.js`，高水位取 4MB、离上限留足余量，并且一次读 8MB 再切块发送，避免每 256KB 就走一次 Blob IPC 把带宽卡在读速上。
+**关于速度**：P2P 直传走 WebRTC DataChannel，有两条浏览器硬限制——单条消息不能超过 `sctp.maxMessageSize`（Chrome 默认 256KB），发送队列总共只有约 16MB，`bufferedAmount` 一超过 `send()` 就直接抛 `RTCDataChannel send queue is full`（不是排队，是抛异常）。 pacing 逻辑集中在 `public/p2p-pump.js`，高水位 2MB、低水位 1MB，并且一次读 8MB 再切块发送，避免每 256KB 就走一次 Blob IPC 把带宽卡在读速上。
 
-**点对点默认开 32 条并行通道**。一个 `RTCPeerConnection` 只有一个 SCTP 关联，拥塞窗口、接收窗口、消息粒度全是按关联算的——实测同一对设备 TCP（SMB）能跑 30MB/s，而单条 DataChannel 只有 3.2MB/s，瓶颈在每关联的机制里，不在链路上，所以加带宽没用，只能加关联。文件按字节范围切段，每条通道独立推一段（各自的 ICE / DTLS / SCTP / 拥塞窗口），接收端按通道顺序拼回原文件。注意同一条关联上开多个 DataChannel 是没用的，它们共享同一个拥塞窗口。
+**发送端的进度和速率按对端实收显示**。只统计"交给发送队列的字节"的话，进度条会被各 lane 的高水位吸收（32 条 × 2MB = 64MB 的吸收窗口）先冲到 100% 再卡住，速率在 2~40MB/s 之间荡——荡的是表，不是链路（接收端一直很稳）。接收端每 1MB 回传一次实收字节数，发送端按它画进度、算速率，两边看到的是同一条曲线。
 
-32 这个值是 CI 双 Chrome + `tc netem` 扫出来的（`tools/p2p-e2e.js --sweep`，速率由对端计时）：
+**点对点自适应开 16~32 条并行通道**。一个 `RTCPeerConnection` 只有一个 SCTP 关联，拥塞窗口、接收窗口、消息粒度全是按关联算的——实测同一对设备 TCP（SMB）能跑 30MB/s，而单条 DataChannel 只有 3.2MB/s，瓶颈在每关联的机制里，不在链路上，所以加带宽没用，只能加关联。文件按字节范围切段，每条通道独立推一段（各自的 ICE / DTLS / SCTP / 拥塞窗口），接收端按通道顺序拼回原文件。注意同一条关联上开多个 DataChannel 是没用的，它们共享同一个拥塞窗口。
+
+最优 lane 数随链路丢包变化，这是 CI 双 Chrome + `tc netem` 扫出来的（`tools/p2p-e2e.js --sweep`，速率由对端计时）：
 
 | 链路 | 1 条 | 4 条 | 8 条 | 16 条 | 32 条 |
 |---|---|---|---|---|---|
@@ -26,7 +28,7 @@
 | 5ms + 0.5% 丢包（TCP 14~44） | 2.3 | 5.7 | 10.9 | **20.0** | 17.1 |
 | 20ms + 2% 丢包（TCP 4.9~5.6） | 0.0 | 0.9 | 1.5 | 3.0 | **4.2** |
 
-好链路上多加 lane 不赚钱甚至略降（1~2 条最快，32 条约为其六七成），但**丢包链路（Wi-Fi 常态）上聚合吞吐随 lane 数单调增长，32 条是 4 条的 3~4.7 倍**——每关联的拥塞窗口一丢包就坍缩，只有并联能补；2% 丢包下 32 条的 4.2 MB/s 已逼近同条件 TCP 基线的 4.9~5.6，等于把链路吃满了。用户的实测（SMB 30MB/s vs 点对点 5.8MB/s）正是丢包特征，所以按丢包最优取值。任何一条 lane 没打开（20 秒超时）会自动退役，本次传输只用双方都活着的那批：file-offer / file-accept 互换活 lane 集合，按交集切段，段数永远对齐。测速页会同时显示链路诊断（候选对类型 host↔host / RTT）和单条通道的速率。
+好链路上多加 lane 不赚钱甚至略降（1~2 条最快，32 条约为其六七成），轻度丢包 16 条最优，重丢包才是 32 条最优。而且多开 lane 不是免费的：每条关联都有独立的 DTLS/SCTP 开销，Chrome 的 DataChannel 通路是 CPU-bound 的，32 条在轻度丢包的 Wi-Fi 上等于拿 CPU 换一点点带宽。所以**不硬编码一个数**：每次连接先用 16 条 lane 探 4MB，对端计时聚合 ≥10MB/s 就用 16 条，慢了才加满到 32 条；探测结果按连接缓存，之后每趟传输的实收速率如果明显变慢会自动升档（只升不降）。任何一条 lane 没打开（20 秒超时）会自动退役，file-offer / file-accept 互换双方活 lane 集合、按交集切段，段数永远对齐。测速页会同时显示链路诊断（候选对类型 host↔host / RTT）和单条通道的速率。
 
 ## 运行
 
@@ -59,7 +61,7 @@ Windows 双击 `start.bat` 即可。
 - **零第三方依赖**。WebSocket 服务端是按 RFC 6455 自己实现的握手与帧编解码，不装 `ws`；上传用裸请求体流式落盘，不装 `multer`/`busboy`。`npm install` 什么都不用装。
 - **不配 STUN/TURN**。纯内网场景下 WebRTC 用本机内网 IP 的 host candidate 就能直连，因此完全离线可用。
 - **分块 + 背压 + 预读**。切片取 `RTCSctpTransport.maxMessageSize` 与 1 MB 的较小值（Chrome 默认 256 KB，比旧的 64 KB 快一个量级）；背压高水位 4 MB、低水位 1 MB，**窗口没打满就连续发、打满了才等一次低水位**。两个坑都踩过：高水位不要往 16 MB 调——Chrome 的 DataChannel 发送队列总共只有约 16 MB，`bufferedAmount` 一超过，`send()` 不是排队而是直接抛 `RTCDataChannel send queue is full`，整次传输当场判死（本机实测 16.3 MB 处必现）；也不要每发一块都等一次——`bufferedamountlow` 的阈值默认是 0、要等整队泄空才触发，实际放行全靠 50 ms 轮询，每块赔一个轮询周期，吞吐被钉在 5 MB/s 左右（实测两个版本都卡在 5M/b）。发送前一次读 8 MB 再切块，避免每块都串行等一次磁盘读取。
-- **点对点 32 条并行通道**。一个 `RTCPeerConnection` 只有一个 SCTP 关联，拥塞窗口、接收窗口、消息粒度全是按关联算的——实测同一对设备 TCP（SMB）能跑 30MB/s，单条 DataChannel 只有 3.2MB/s，瓶颈在每关联的机制里，不在链路上。文件按 `splitRange` 切成若干段，每条通道（独立 pc / ICE / DTLS / SCTP / 拥塞窗口）推一段，接收端按通道顺序拼回。同一条关联上开多个 DataChannel 没用，共享拥塞窗口。lane 数定 32 是 CI 在 `tc netem` 损伤下扫出来的（见上文速度一节）：丢包链路上聚合吞吐随 lane 数单调增长，32 条是 4 条的 3~4.7 倍。任何一条 lane 打不开（20 秒超时）就退役，双方交换活 lane 集合、按交集切段——一边少一条 lane 也不会让段数错位、永远等不到收尾。测速页显示链路诊断（host↔host / RTT）和单通道速率，用来判断并行到底有没有赚到。
+- **点对点自适应 16~32 条并行通道**。一个 `RTCPeerConnection` 只有一个 SCTP 关联，拥塞窗口、接收窗口、消息粒度全是按关联算的——实测同一对设备 TCP（SMB）能跑 30MB/s，单条 DataChannel 只有 3.2MB/s，瓶颈在每关联的机制里，不在链路上。文件按 `splitRange` 切成若干段，每条通道（独立 pc / ICE / DTLS / SCTP / 拥塞窗口）推一段，接收端按通道顺序拼回。同一条关联上开多个 DataChannel 没用，共享拥塞窗口。最优 lane 数随链路丢包变（见上文速度一节的实测表），所以不硬编码：16 条探测、慢才加开到 32，结果按连接缓存，实收速率明显变慢时自动升档。任何一条 lane 打不开（20 秒超时）就退役，双方交换活 lane 集合、按交集切段——一边少一条 lane 也不会让段数错位、永远等不到收尾。测速页显示链路诊断（host↔host / RTT）和单通道速率，用来判断并行到底有没有赚到。
 - **断点续传**。直传按 `name|size|lastModified` 生成 `fileId`，中断时记下已收偏移，重发时接收端回 `offset` 从断点继续；文件库上传按 4 MB 分块带 `offset` 续写 `.part`，先查 `/api/upload-status` 定位起点；下载由 HTTP Range 提供。
 - **设备名持久化**。浏览器端存 `localStorage`，服务端按 IP 记住上次的名字，刷新和重连都保持。
 - **pacing 单独一个文件**。`public/p2p-pump.js` 用 UMD 包了一层，Node 里可以直接 `require`；测试用假 DataChannel 复现 Chrome 的 16 MB 队列上限来跑真代码——背压阈值这类边界靠真机点文件是点不出来的。
